@@ -1,13 +1,28 @@
-import { apiUrl } from "@/lib/api";
+import { apiFetch, apiUrl as baseApiUrl } from "@/lib/api";
 import { invalidateClientCache, withClientCache } from "@/lib/client-cache";
+import { asJsonOrThrow as asJson } from "@/lib/api";
+
+function skillWorkspace(): string {
+  return typeof window === "undefined" ? "" : new URLSearchParams(window.location.search).get("skill_workspace") ?? "";
+}
+
+function apiUrl(path: string): string {
+  const url = baseApiUrl(path);
+  const scope = skillWorkspace();
+  return scope ? `${url}${url.includes("?") ? "&" : "?"}skill_workspace=${encodeURIComponent(scope)}` : url;
+}
 
 const SKILLS_CACHE_PREFIX = "skills:";
 const SKILL_TAGS_CACHE_KEY = `${SKILLS_CACHE_PREFIX}tags`;
+
+export type SkillSource = "user" | "builtin" | "admin";
 
 export interface SkillInfo {
   name: string;
   description: string;
   tags: string[];
+  source?: SkillSource;
+  read_only?: boolean;
 }
 
 export interface SkillDetail extends SkillInfo {
@@ -28,6 +43,10 @@ export interface UpdateSkillPayload {
   tags?: string[];
 }
 
+function normalizeSource(raw: unknown): SkillSource {
+  return raw === "builtin" || raw === "admin" ? raw : "user";
+}
+
 function normalizeTags(raw: unknown): string[] {
   if (!Array.isArray(raw)) return [];
   const seen = new Set<string>();
@@ -43,36 +62,30 @@ function normalizeTags(raw: unknown): string[] {
   return out;
 }
 
-async function asJson(response: Response) {
-  if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`;
-    try {
-      const body = await response.json();
-      if (body?.detail) detail = String(body.detail);
-    } catch {
-      /* ignore */
-    }
-    throw new Error(detail);
-  }
-  return response.json();
-}
-
 export async function listSkills(options?: {
   force?: boolean;
 }): Promise<SkillInfo[]> {
   return withClientCache<SkillInfo[]>(
-    `${SKILLS_CACHE_PREFIX}list`,
+    `${SKILLS_CACHE_PREFIX}list:${skillWorkspace()}`,
     async () => {
-      const response = await fetch(apiUrl("/api/v1/skills/list"), {
+      const response = await apiFetch(apiUrl("/api/skills/list"), {
         cache: "no-store",
       });
       const data = await asJson(response);
       const items = Array.isArray(data?.skills) ? data.skills : [];
       return items.map(
-        (item: { name?: unknown; description?: unknown; tags?: unknown }) => ({
+        (item: {
+          name?: unknown;
+          description?: unknown;
+          tags?: unknown;
+          source?: unknown;
+          read_only?: unknown;
+        }) => ({
           name: String(item?.name ?? ""),
           description: String(item?.description ?? ""),
           tags: normalizeTags(item?.tags),
+          source: normalizeSource(item?.source),
+          read_only: Boolean(item?.read_only),
         }),
       );
     },
@@ -81,8 +94,8 @@ export async function listSkills(options?: {
 }
 
 export async function getSkill(name: string): Promise<SkillDetail> {
-  const response = await fetch(
-    apiUrl(`/api/v1/skills/${encodeURIComponent(name)}`),
+  const response = await apiFetch(
+    apiUrl(`/api/skills/${encodeURIComponent(name)}`),
     {
       cache: "no-store",
     },
@@ -93,13 +106,142 @@ export async function getSkill(name: string): Promise<SkillDetail> {
     description: String(data?.description ?? ""),
     content: String(data?.content ?? ""),
     tags: normalizeTags(data?.tags),
+    source: normalizeSource(data?.source),
+    read_only: Boolean(data?.read_only),
+  };
+}
+
+export interface InstalledSkill {
+  name: string;
+  version: string;
+  verdict: { status: string; detail: string };
+}
+
+/**
+ * Import a hub skill (e.g. from EduHub) into the caller's own skill layer.
+ * `ref` is a `<hub>:<slug>[@version]` reference — the EduHub import flow always
+ * builds an `eduhub:` ref. Surfaces the hub's security verdict so callers can
+ * warn on `unknown`/`suspicious` packages.
+ */
+export async function installSkillFromHub(
+  ref: string,
+  options?: { name?: string; force?: boolean; allowUnverified?: boolean },
+): Promise<InstalledSkill> {
+  const response = await apiFetch(apiUrl("/api/skills/install"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ref,
+      name: options?.name,
+      force: options?.force ?? false,
+      allow_unverified: options?.allowUnverified ?? false,
+    }),
+  });
+  const data = await asJson(response);
+  invalidateSkillsCache();
+  return {
+    name: String(data?.skill?.name ?? ""),
+    version: String(data?.version ?? ""),
+    verdict: {
+      status: String(data?.verdict?.status ?? "unknown"),
+      detail: String(data?.verdict?.detail ?? ""),
+    },
+  };
+}
+
+// ── EduHub / hub browsing ───────────────────────────────────────────────
+// Powers the in-app "Import from EduHub" browser. The backend proxies the
+// hub's public catalog (no login, no iframe), so the panel can render hub
+// skills in DeepTutor's own UI and download them with one click.
+
+export interface HubSkillListing {
+  slug: string;
+  name: string;
+  summary: string;
+  version: string;
+  downloads: number;
+  stars: number;
+  owner: string;
+  ownerUrl: string;
+}
+
+export interface HubCatalog {
+  hub: string;
+  /** The hub's website origin (for a "view on EduHub" link out). */
+  webUrl: string;
+  skills: HubSkillListing[];
+}
+
+export interface HubSkillDetail extends HubSkillListing {
+  content: string;
+  tags: string[];
+  /** Direct link to this skill's page on the hub site. */
+  webUrl: string;
+}
+
+function normalizeHubListing(item: Record<string, unknown>): HubSkillListing {
+  return {
+    slug: String(item?.slug ?? ""),
+    name: String(item?.name ?? item?.slug ?? ""),
+    summary: String(item?.summary ?? ""),
+    version: String(item?.version ?? ""),
+    downloads: Number(item?.downloads ?? 0),
+    stars: Number(item?.stars ?? 0),
+    owner: String(item?.owner ?? ""),
+    ownerUrl: String(item?.owner_url ?? ""),
+  };
+}
+
+/** List skills available on a hub (default EduHub). `query` filters server-side. */
+export async function fetchHubCatalog(options?: {
+  hub?: string;
+  query?: string;
+  limit?: number;
+}): Promise<HubCatalog> {
+  const params = new URLSearchParams();
+  if (options?.hub) params.set("hub", options.hub);
+  if (options?.query) params.set("q", options.query);
+  if (options?.limit) params.set("limit", String(options.limit));
+  const qs = params.toString();
+  const response = await apiFetch(
+    apiUrl(`/api/skills/hub/catalog${qs ? `?${qs}` : ""}`),
+    { cache: "no-store" },
+  );
+  const data = await asJson(response);
+  const skills = Array.isArray(data?.skills) ? data.skills : [];
+  return {
+    hub: String(data?.hub ?? "eduhub"),
+    webUrl: String(data?.web_url ?? ""),
+    skills: skills.map((item: Record<string, unknown>) =>
+      normalizeHubListing(item),
+    ),
+  };
+}
+
+/** Full metadata + rendered SKILL.md body for one hub skill. */
+export async function fetchHubSkillDetail(
+  slug: string,
+  options?: { hub?: string },
+): Promise<HubSkillDetail> {
+  const params = new URLSearchParams({ slug });
+  if (options?.hub) params.set("hub", options.hub);
+  const response = await apiFetch(
+    apiUrl(`/api/skills/hub/detail?${params.toString()}`),
+    { cache: "no-store" },
+  );
+  const data = await asJson(response);
+  return {
+    ...normalizeHubListing(data),
+    content: String(data?.content ?? ""),
+    tags: normalizeTags(data?.tags),
+    webUrl: String(data?.web_url ?? ""),
   };
 }
 
 export async function createSkill(
   payload: CreateSkillPayload,
 ): Promise<SkillInfo> {
-  const response = await fetch(apiUrl("/api/v1/skills/create"), {
+  const response = await apiFetch(apiUrl("/api/skills/create"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -122,8 +264,8 @@ export async function updateSkill(
   name: string,
   payload: UpdateSkillPayload,
 ): Promise<SkillInfo> {
-  const response = await fetch(
-    apiUrl(`/api/v1/skills/${encodeURIComponent(name)}`),
+  const response = await apiFetch(
+    apiUrl(`/api/skills/${encodeURIComponent(name)}`),
     {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -140,8 +282,8 @@ export async function updateSkill(
 }
 
 export async function deleteSkill(name: string): Promise<void> {
-  const response = await fetch(
-    apiUrl(`/api/v1/skills/${encodeURIComponent(name)}`),
+  const response = await apiFetch(
+    apiUrl(`/api/skills/${encodeURIComponent(name)}`),
     {
       method: "DELETE",
     },
@@ -156,7 +298,7 @@ export async function listSkillTags(options?: {
   return withClientCache<string[]>(
     SKILL_TAGS_CACHE_KEY,
     async () => {
-      const response = await fetch(apiUrl("/api/v1/skills/tags/list"), {
+      const response = await apiFetch(apiUrl("/api/skills/tags/list"), {
         cache: "no-store",
       });
       const data = await asJson(response);
@@ -167,7 +309,7 @@ export async function listSkillTags(options?: {
 }
 
 export async function createSkillTag(name: string): Promise<string> {
-  const response = await fetch(apiUrl("/api/v1/skills/tags/create"), {
+  const response = await apiFetch(apiUrl("/api/skills/tags/create"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
@@ -181,8 +323,8 @@ export async function renameSkillTag(
   oldName: string,
   newName: string,
 ): Promise<string> {
-  const response = await fetch(
-    apiUrl(`/api/v1/skills/tags/${encodeURIComponent(oldName)}`),
+  const response = await apiFetch(
+    apiUrl(`/api/skills/tags/${encodeURIComponent(oldName)}`),
     {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -195,8 +337,8 @@ export async function renameSkillTag(
 }
 
 export async function deleteSkillTag(name: string): Promise<void> {
-  const response = await fetch(
-    apiUrl(`/api/v1/skills/tags/${encodeURIComponent(name)}`),
+  const response = await apiFetch(
+    apiUrl(`/api/skills/tags/${encodeURIComponent(name)}`),
     {
       method: "DELETE",
     },

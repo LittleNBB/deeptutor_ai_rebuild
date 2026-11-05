@@ -2,63 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import re
-from typing import Any
 
-
-def extract_json_object(text: str) -> dict[str, Any]:
-    """Extract a JSON object from raw model output."""
-    raw = (text or "").strip()
-    if not raw:
-        return {}
-
-    fenced = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", raw)
-    candidates = fenced + [raw]
-
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            parsed = _decode_first_json_object(candidate)
-            if parsed is not None:
-                return parsed
-
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        snippet = raw[start : end + 1]
-        try:
-            return json.loads(snippet)
-        except json.JSONDecodeError:
-            parsed = _decode_first_json_object(snippet)
-            if parsed is not None:
-                return parsed
-
-    raise json.JSONDecodeError("No JSON object found", raw, 0)
-
-
-def _decode_first_json_object(text: str) -> dict[str, Any] | None:
-    decoder = json.JSONDecoder()
-    stripped = (text or "").lstrip()
-    if not stripped:
-        return None
-
-    starts = [0]
-    brace_index = stripped.find("{")
-    if brace_index > 0:
-        starts.append(brace_index)
-
-    for start in starts:
-        try:
-            parsed, _end = decoder.raw_decode(stripped[start:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            return parsed
-    return None
+from deeptutor.agents._shared.json_output import extract_json_object
+from deeptutor.services.llm import StreamOutcome
+from deeptutor.services.llm.utils import clean_thinking_tags
 
 
 def slugify_filename(value: str, fallback: str) -> str:
@@ -70,10 +18,15 @@ def trim_error_message(stderr: str, limit: int = 1200) -> str:
     text = (stderr or "").strip()
     if len(text) <= limit:
         return text
-    return text[-limit:]
+    separator = "\n…\n"
+    if limit <= len(separator):
+        return text[:limit]
+    head = (limit - len(separator)) // 2
+    tail = limit - len(separator) - head
+    return text[:head] + separator + text[-tail:]
 
 
-def build_repair_error_message(error_message: str) -> str:
+def build_repair_error_message(error_message: str, *, code: str = "") -> str:
     text = (error_message or "").strip()
     lowered = text.lower()
     hints: list[str] = []
@@ -93,14 +46,78 @@ def build_repair_error_message(error_message: str) -> str:
             "Check any custom point lists, helper lines, braces, polygons, or manually assembled VMobject paths."
         )
 
+    if re.search(r"\b(?:MathTex|Tex)\s*\(", code) and (
+        "filenotfounderror" in lowered or "winerror 2" in lowered
+    ):
+        hints.append(
+            "This scene uses MathTex/Tex and a renderer executable was not found. "
+            "Check that latex and dvisvgm are installed on PATH, or use Text "
+            "when a LaTeX toolchain is unavailable."
+        )
+
     if not hints:
         return text
 
     return text + "\n\nTargeted repair hints:\n- " + "\n- ".join(hints)
 
 
+def describe_unusable_output(
+    *,
+    error: Exception | None,
+    raw_response: str,
+    outcome: StreamOutcome,
+    max_tokens: int,
+) -> str:
+    """Name which of the three code-generation failures actually happened.
+
+    Truncated output, an empty response and malformed JSON all used to surface
+    as the same "no usable code" message with the parse error only in the
+    traceback, so nobody could tell them apart without patching the file
+    (#1545). The three read very differently to whoever has to act: only the
+    first one is fixed by raising the budget.
+    """
+
+    thinking_chars = max(0, len(raw_response) - len(clean_thinking_tags(raw_response)))
+    shape = f"{len(raw_response)} chars"
+    if thinking_chars:
+        shape += f", {thinking_chars} of them chain-of-thought"
+    reason = (outcome.finish_reason or "none").strip() or "none"
+    if outcome.truncated:
+        reported = ", ".join(
+            f"{key}={outcome.usage[key]}"
+            for key in ("completion_tokens", "reasoning_tokens")
+            if key in outcome.usage
+        )
+        detail = f"finish_reason={reason}" + (f", {reported}" if reported else "")
+        return (
+            f"the response ({shape}) was cut off at the {max_tokens}-token output cap "
+            f"({detail}), so the code JSON never completed — raise the math animator's "
+            "max tokens in Settings → Capabilities, or pick a model that reasons less"
+        )
+    if not raw_response.strip():
+        return f"the model returned no text at all (finish_reason={reason})"
+    return f"the response ({shape}) contained no usable JSON object: {error}"
+
+
+def escalated_max_tokens(base: int, truncations: int) -> int:
+    """Grow the output budget after a truncation instead of repeating it.
+
+    Retrying a truncated generation on the same budget is deterministic waste —
+    9 attempts, 21 minutes, same ending (#1547). The growth is capped at twice
+    the configured budget because a ``max_tokens`` above the model's own output
+    limit is rejected outright, which would turn a truncated answer into no
+    answer at all.
+    """
+
+    if base <= 0 or truncations <= 0:
+        return base
+    return min(int(base * 2), int(base * 1.5**truncations))
+
+
 __all__ = [
     "build_repair_error_message",
+    "describe_unusable_output",
+    "escalated_max_tokens",
     "extract_json_object",
     "slugify_filename",
     "trim_error_message",

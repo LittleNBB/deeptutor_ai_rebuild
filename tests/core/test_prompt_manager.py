@@ -33,12 +33,27 @@ class TestPromptManager:
         pm = get_prompt_manager()
         prompts = pm.load_prompts(
             module_name="research",
-            agent_name="research_agent",
+            agent_name="pipeline",
             language="en",
         )
         assert isinstance(prompts, dict)
-        # research_agent should have system section
-        assert "system" in prompts or prompts == {}
+        # pipeline.yaml carries one section per phase, each of which has
+        # its own ``system`` body.
+        assert (
+            any(
+                isinstance(prompts.get(phase), dict) and "system" in prompts[phase]
+                for phase in ("rephrase", "decompose", "research_step", "report")
+            )
+            or prompts == {}
+        )
+
+    def test_load_prompts_math_animator_concept_analysis(self):
+        """Math animator prompts must be available to the shared loader."""
+        pm = get_prompt_manager()
+        prompts = pm.reload_prompts("math_animator", "concept_analysis_agent", "zh")
+
+        assert prompts["system"]
+        assert prompts["user_template"]
 
     def test_load_prompts_solve_module(self):
         """Test loading prompts for solve module."""
@@ -66,10 +81,10 @@ class TestPromptManager:
         pm = get_prompt_manager()
 
         # First load
-        prompts1 = pm.load_prompts("research", "research_agent", "en")
+        prompts1 = pm.load_prompts("research", "pipeline", "en")
 
         # Second load should return cached version
-        prompts2 = pm.load_prompts("research", "research_agent", "en")
+        prompts2 = pm.load_prompts("research", "pipeline", "en")
 
         assert prompts1 is prompts2
 
@@ -78,8 +93,8 @@ class TestPromptManager:
         pm = get_prompt_manager()
 
         # Load some prompts
-        pm.load_prompts("research", "research_agent", "en")
-        pm.load_prompts("solve", "solve_agent", "en")
+        pm.load_prompts("research", "pipeline", "en")
+        pm.load_prompts("math_animator", "concept_analysis_agent", "en")
 
         assert len(pm._cache) >= 2
 
@@ -91,14 +106,14 @@ class TestPromptManager:
         pm = get_prompt_manager()
 
         # Load prompts for multiple modules
-        pm.load_prompts("research", "research_agent", "en")
-        pm.load_prompts("solve", "solve_agent", "en")
+        pm.load_prompts("research", "pipeline", "en")
+        pm.load_prompts("math_animator", "concept_analysis_agent", "en")
 
         # Clear only research cache
         pm.clear_cache("research")
 
         # Solve prompts should still be cached
-        assert any("solve" in k for k in pm._cache)
+        assert any("math_animator" in k for k in pm._cache)
         assert not any("research" in k for k in pm._cache)
 
     def test_get_prompt_helper(self):
@@ -130,7 +145,7 @@ class TestPromptManager:
         pm = get_prompt_manager()
 
         # Even with a potentially missing language, should fallback
-        prompts = pm.load_prompts("research", "research_agent", "zh")
+        prompts = pm.load_prompts("research", "pipeline", "zh")
         assert isinstance(prompts, dict)
 
     def test_reload_prompts(self):
@@ -138,15 +153,15 @@ class TestPromptManager:
         pm = get_prompt_manager()
 
         # Load and cache
-        prompts1 = pm.load_prompts("research", "research_agent", "en")
+        prompts1 = pm.load_prompts("research", "pipeline", "en")
 
         # Force reload
-        prompts2 = pm.reload_prompts("research", "research_agent", "en")
+        prompts2 = pm.reload_prompts("research", "pipeline", "en")
 
         # They should be equal but not the same object
         assert prompts1 == prompts2
         # After reload, cache should have fresh entry
-        cache_key = "research_research_agent_en"
+        cache_key = "research_pipeline_en"
         assert cache_key in pm._cache
 
 
@@ -173,7 +188,7 @@ class TestPromptManagerLanguages:
         """Test that invalid language code falls back gracefully."""
         pm = get_prompt_manager()
         # Should not raise, should fallback
-        prompts = pm.load_prompts("research", "research_agent", "invalid")
+        prompts = pm.load_prompts("research", "pipeline", "invalid")
         assert isinstance(prompts, dict)
 
 

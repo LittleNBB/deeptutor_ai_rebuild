@@ -33,14 +33,24 @@ MODEL_PRICING = {
     "gpt-3.5-turbo": {"input": 0.0005, "output": 0.0015},
     # DeepSeek Series (支持缓存命中计费)
     "deepseek-chat": {
-        "input": 0.00014,               # 缓存未命中价格 (USD/1K) ≈ ¥1/百万
-        "output": 0.00028,              # 输出价格 (USD/1K)      ≈ ¥2/百万
-        "cache_hit_input": 0.0000028,   # 缓存命中输入价格 (USD/1K) ≈ ¥0.02/百万
+        "input": 0.00014,
+        "output": 0.00028,
+        "cache_hit_input": 0.0000028,
     },
     "deepseek-coder": {
         "input": 0.00014,
         "output": 0.00028,
         "cache_hit_input": 0.0000028,
+    },
+    "deepseek-v4-flash": {
+        "input": 0.00014,
+        "output": 0.00028,
+        "cache_hit_input": 0.0000028,
+    },
+    "deepseek-v4-pro": {
+        "input": 0.000435,
+        "output": 0.00087,
+        "cache_hit_input": 0.0000087,
     },
 }
 

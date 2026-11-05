@@ -6,12 +6,57 @@ Responsible for extracting citation information from tool calls and managing cit
 
 import asyncio
 from datetime import datetime
+import html
 import json
 from pathlib import Path
 from typing import Any
 
 from deeptutor.services.path_service import get_path_service
 from deeptutor.utils.json_parser import parse_json_response
+
+_RAG_SOURCE_FIELDS = ("chunks", "documents", "sources", "context", "retrieved_docs")
+
+
+def _as_text(value: Any) -> str:
+    """Normalize optional source metadata without leaking ``None`` values."""
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else str(value)
+
+
+def _rag_source_payload(answer_data: Any) -> tuple[list[Any], str]:
+    """Normalize the object- and list-shaped payloads returned by RAG tools."""
+    if isinstance(answer_data, list):
+        return answer_data, ""
+    if not isinstance(answer_data, dict):
+        return [], ""
+
+    kb_name = _as_text(answer_data.get("kb_name"))
+    for field_name in _RAG_SOURCE_FIELDS:
+        value = answer_data.get(field_name)
+        if isinstance(value, list):
+            return value, kb_name
+    return [], kb_name
+
+
+def _rag_source_info(document: Any, index: int) -> dict[str, Any]:
+    """Convert one heterogeneous RAG result into stable citation metadata."""
+    if isinstance(document, str):
+        return {"content_preview": document[:200]}
+    if not isinstance(document, dict):
+        return {}
+
+    content = document.get("content", document.get("text", ""))
+    return {
+        "title": _as_text(document.get("title", document.get("doc_title", ""))),
+        "content_preview": _as_text(content)[:200],
+        "source_file": _as_text(
+            document.get("source", document.get("file_path", document.get("filename", "")))
+        ),
+        "page": document.get("page", document.get("page_number", "")),
+        "chunk_id": document.get("chunk_id", document.get("id", index)),
+        "score": document.get("score", document.get("similarity", "")),
+    }
 
 
 class CitationManager:
@@ -236,6 +281,7 @@ class CitationManager:
         tool_type: str,
         tool_trace: Any,
         raw_answer: str,  # Raw answer JSON string
+        tool_metadata: dict[str, Any] | None = None,
     ) -> bool:
         """
         Add citation information
@@ -245,6 +291,10 @@ class CitationManager:
             tool_type: Tool type
             tool_trace: ToolTrace object
             raw_answer: Raw answer (JSON string)
+            tool_metadata: Structured ToolResult.metadata for this call, when
+                available. Extractors prefer this over reparsing ``raw_answer``
+                because tool messages now carry the textual answer rather than
+                a JSON payload.
 
         Returns:
             Whether addition was successful
@@ -252,19 +302,21 @@ class CitationManager:
         try:
             tool_type_lower = tool_type.lower()
 
-            if tool_type_lower in ("rag", "rag_naive", "rag_hybrid"):
+            if tool_type_lower in ("rag", "rag_naive", "rag_hybrid") or tool_type_lower.startswith(
+                ("pageindex_cloud_", "pageindex_oss_")
+            ):
                 citation_info = self._extract_rag_citation(
-                    citation_id, "rag", raw_answer, tool_trace
+                    citation_id, tool_type, raw_answer, tool_trace, tool_metadata
                 )
             elif tool_type_lower == "web_search":
                 citation_info = self._extract_web_citation(
-                    citation_id, tool_type, raw_answer, tool_trace
+                    citation_id, tool_type, raw_answer, tool_trace, tool_metadata
                 )
             elif tool_type_lower == "paper_search":
                 citation_info = self._extract_paper_citation(
-                    citation_id, tool_type, raw_answer, tool_trace
+                    citation_id, tool_type, raw_answer, tool_trace, tool_metadata
                 )
-            elif tool_type_lower == "run_code":
+            elif tool_type_lower == "exec":
                 citation_info = self._extract_code_citation(citation_id, tool_type, tool_trace)
             else:
                 # Unknown tool type, use generic format
@@ -280,9 +332,22 @@ class CitationManager:
             return False
 
     def _extract_rag_citation(
-        self, citation_id: str, tool_type: str, raw_answer: str, tool_trace: Any
+        self,
+        citation_id: str,
+        tool_type: str,
+        raw_answer: str,
+        tool_trace: Any,
+        tool_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Extract citation information for RAG retrieval with source documents"""
+        """Extract citation information for RAG retrieval with source documents.
+
+        Prefers the structured ``ToolResult.metadata`` for the same reason
+        :meth:`_extract_web_citation` does: ``raw_answer`` is the textual
+        answer surfaced to the LLM, not a JSON payload, so parsing it usually
+        yields no sources at all. Every RAG pipeline normalises what it
+        retrieved into ``metadata["sources"]`` (see ``tools/builtin``), which
+        is already the shape ``_rag_source_payload`` reads.
+        """
         citation_info = {
             "citation_id": citation_id,
             "tool_type": tool_type,
@@ -293,115 +358,137 @@ class CitationManager:
         }
 
         try:
-            # Parse raw_answer to extract source information
-            answer_data = parse_json_response(raw_answer)
+            source_documents, kb_name = _rag_source_payload(tool_metadata)
+            if not source_documents:
+                # No metadata (older traces, or a tool that only returns text):
+                # fall back to parsing the answer, which is what this did before
+                # the structured payload reached here.
+                documents, answer_kb_name = _rag_source_payload(parse_json_response(raw_answer))
+                source_documents = documents
+                kb_name = kb_name or answer_kb_name
+            sources = [
+                source_info
+                for index, document in enumerate(source_documents[:5])
+                if (source_info := _rag_source_info(document, index))
+            ]
 
-            # Extract source documents if available
-            # Common fields in RAG responses: chunks, documents, sources, context
-            sources = []
-
-            # Try different field names for source documents
-            for field_name in ["chunks", "documents", "sources", "context", "retrieved_docs"]:
-                if field_name in answer_data:
-                    source_list = answer_data[field_name]
-                    if isinstance(source_list, list):
-                        for i, doc in enumerate(source_list[:5]):  # Limit to 5 sources
-                            source_info = {}
-                            if isinstance(doc, dict):
-                                source_info["title"] = doc.get("title", doc.get("doc_title", ""))
-                                source_info["content_preview"] = doc.get(
-                                    "content", doc.get("text", "")
-                                )[:200]
-                                source_info["source_file"] = doc.get(
-                                    "source", doc.get("file_path", doc.get("filename", ""))
-                                )
-                                source_info["page"] = doc.get("page", doc.get("page_number", ""))
-                                source_info["chunk_id"] = doc.get("chunk_id", doc.get("id", i))
-                                source_info["score"] = doc.get("score", doc.get("similarity", ""))
-                            elif isinstance(doc, str):
-                                source_info["content_preview"] = doc[:200]
-                            if source_info:
-                                sources.append(source_info)
-                    break
-
-            # Also extract kb_name if available
-            citation_info["kb_name"] = answer_data.get("kb_name", "")
+            citation_info["kb_name"] = kb_name
             citation_info["sources"] = sources
             citation_info["total_sources"] = len(sources)
 
-        except (json.JSONDecodeError, Exception) as e:
+        except Exception as e:
             # If parsing fails, still return basic citation info
             print(f"⚠️ Failed to parse RAG source info: {e}")
 
         return citation_info
 
     def _extract_web_citation(
-        self, citation_id: str, tool_type: str, raw_answer: str, tool_trace: Any
+        self,
+        citation_id: str,
+        tool_type: str,
+        raw_answer: str,
+        tool_trace: Any,
+        tool_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Extract citation information for web search with URLs"""
+        """Extract citation information for web search with URLs.
+
+        Prefers the structured ``ToolResult.metadata`` (which carries the
+        provider's ``citations``/``results`` list) because ``raw_answer`` is
+        the textual answer surfaced to the LLM, not a JSON payload.
+        """
         citation_info = {
             "citation_id": citation_id,
             "tool_type": tool_type,
             "query": tool_trace.query,
             "summary": tool_trace.summary,
             "timestamp": tool_trace.timestamp,
-            "web_sources": [],  # List of web sources with URLs
+            "web_sources": [],
         }
 
-        try:
-            # Parse raw_answer to extract web source information
-            answer_data = parse_json_response(raw_answer)
+        web_sources: list[dict[str, Any]] = []
 
-            web_sources = []
-
-            # Try different field names for web results
-            for field_name in ["results", "web_results", "search_results", "urls"]:
-                if field_name in answer_data:
-                    result_list = answer_data[field_name]
-                    if isinstance(result_list, list):
-                        for result in result_list[:5]:  # Limit to 5 sources
-                            if isinstance(result, dict):
-                                web_source = {
-                                    "title": result.get("title", ""),
-                                    "url": result.get("url", result.get("link", "")),
-                                    "snippet": result.get("snippet", result.get("description", ""))[
-                                        :200
-                                    ],
-                                    "domain": result.get("domain", ""),
-                                }
-                                if web_source["url"]:  # Only add if URL exists
-                                    web_sources.append(web_source)
+        candidate_lists: list[Any] = []
+        if isinstance(tool_metadata, dict):
+            for field_name in ("citations", "results", "web_results", "search_results", "urls"):
+                value = tool_metadata.get(field_name)
+                if isinstance(value, list) and value:
+                    candidate_lists.append(value)
                     break
 
-            citation_info["web_sources"] = web_sources
-            citation_info["total_sources"] = len(web_sources)
+        if not candidate_lists:
+            try:
+                answer_data = parse_json_response(raw_answer)
+                if isinstance(answer_data, dict):
+                    for field_name in (
+                        "citations",
+                        "results",
+                        "web_results",
+                        "search_results",
+                        "urls",
+                    ):
+                        value = answer_data.get(field_name)
+                        if isinstance(value, list) and value:
+                            candidate_lists.append(value)
+                            break
+            except (json.JSONDecodeError, Exception):
+                pass
 
-        except (json.JSONDecodeError, Exception) as e:
-            # If parsing fails, still return basic citation info
-            print(f"⚠️ Failed to parse web source info: {e}")
+        for result_list in candidate_lists:
+            for result in result_list:
+                if not isinstance(result, dict):
+                    continue
+                url = result.get("url") or result.get("link") or ""
+                if not url:
+                    continue
+                snippet = result.get("snippet") or result.get("description") or ""
+                web_sources.append(
+                    {
+                        "title": result.get("title", ""),
+                        "url": url,
+                        "snippet": snippet[:200],
+                        "domain": result.get("domain", ""),
+                    }
+                )
 
+        citation_info["web_sources"] = web_sources
+        citation_info["total_sources"] = len(web_sources)
         return citation_info
 
     def _extract_paper_citation(
-        self, citation_id: str, tool_type: str, raw_answer: str, tool_trace: Any
+        self,
+        citation_id: str,
+        tool_type: str,
+        raw_answer: str,
+        tool_trace: Any,
+        tool_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Extract citation information for paper search - supports multiple papers"""
+        """Extract citation information for paper search - supports multiple papers.
+
+        Prefers ``tool_metadata['papers']`` (set by ``PaperSearchToolWrapper``)
+        because the tool message ``content`` is a markdown listing rather than
+        a JSON payload.
+        """
         citation_info = {
             "citation_id": citation_id,
             "tool_type": tool_type,
             "query": tool_trace.query,
             "summary": tool_trace.summary,
             "timestamp": tool_trace.timestamp,
-            "papers": [],  # Store all papers, not just the first one
+            "papers": [],
         }
 
         try:
-            # Parse raw_answer JSON
-            answer_data = parse_json_response(raw_answer)
-            papers = answer_data.get("papers", [])
+            papers: list[Any] = []
+            if isinstance(tool_metadata, dict):
+                meta_papers = tool_metadata.get("papers")
+                if isinstance(meta_papers, list):
+                    papers = meta_papers
+            if not papers:
+                answer_data = parse_json_response(raw_answer)
+                if isinstance(answer_data, dict):
+                    papers = answer_data.get("papers", []) or []
 
             if not papers:
-                # If no papers, return basic info
                 return citation_info
 
             # Process ALL papers (up to 5 for practicality)
@@ -481,14 +568,12 @@ class CitationManager:
         return self.citations_file
 
     def format_citation_for_report(self, citation_id: str) -> str | None:
-        """
-        Format citation information for report display
+        """Render a reference-list entry for ``citation_id`` as HTML.
 
-        Args:
-            citation_id: Citation ID
-
-        Returns:
-            Formatted citation string, or None if not found
+        Output may include ``<em>``, ``<a>``, and ``<br>`` tags. All
+        user-controlled fields are HTML-escaped inside this method so the
+        caller can drop the result directly into the page without an extra
+        escape pass.
         """
         citation = self.get_citation(citation_id)
         if not citation:
@@ -497,69 +582,112 @@ class CitationManager:
         tool_type = citation.get("tool_type", "").lower()
 
         if tool_type == "paper_search":
-            # Standard academic citation format
-            title = citation.get("title", "")
-            authors = citation.get("authors", "")
-            year = citation.get("year", "")
-            url = citation.get("url", "")
-            arxiv_id = citation.get("arxiv_id", "")
-
-            # Build citation string
-            parts = []
-            if authors:
-                parts.append(authors)
-            if year:
-                parts.append(f"({year})")
-            if title:
-                parts.append(f'"{title}"')
-            if arxiv_id:
-                parts.append(f"arXiv:{arxiv_id}")
-            if url:
-                parts.append(f"<{url}>")
-
-            # Add note about additional papers if available
-            total_papers = citation.get("total_papers", 1)
-            if total_papers > 1:
-                parts.append(f"[+{total_papers - 1} more papers]")
-
-            return " ".join(parts) if parts else None
+            return self._format_paper_search_apa(citation)
 
         if tool_type in ("rag", "rag_naive", "rag_hybrid"):
-            query = citation.get("query", "")
+            query = html.escape(str(citation.get("query", "")))
             kb_name = citation.get("kb_name", "")
-            sources = citation.get("sources", [])
+            sources = citation.get("sources", []) or []
 
             parts = [f"RAG: {query}"]
             if kb_name:
-                parts.append(f"[KB: {kb_name}]")
-            if sources:
-                source_titles = [s.get("title", s.get("source_file", "")) for s in sources[:3] if s]
-                source_titles = [t for t in source_titles if t]
-                if source_titles:
-                    parts.append(f"[Sources: {', '.join(source_titles)}]")
-
+                parts.append(f"[KB: {html.escape(str(kb_name))}]")
+            source_titles = [
+                html.escape(str(s.get("title") or s.get("source_file") or ""))
+                for s in sources[:3]
+                if s
+            ]
+            source_titles = [t for t in source_titles if t]
+            if source_titles:
+                parts.append(f"[Sources: {', '.join(source_titles)}]")
             return " ".join(parts)
 
         if tool_type == "web_search":
-            # Web search with URLs
-            query = citation.get("query", "")
-            web_sources = citation.get("web_sources", [])
+            return self._format_web_search_with_links(citation)
 
-            parts = [f"Web Search: {query}"]
-            if web_sources:
-                urls = [s.get("url", "") for s in web_sources[:3] if s.get("url")]
-                if urls:
-                    parts.append(f"[URLs: {', '.join(urls)}]")
+        tool_type_display = {"exec": "Code Execution"}.get(tool_type, tool_type)
+        query = html.escape(str(citation.get("query", "")))
+        return f"{html.escape(str(tool_type_display))}: {query}"
 
-            return " ".join(parts)
+    def _format_paper_search_apa(self, citation: dict[str, Any]) -> str | None:
+        """Render each paper in a paper_search citation as a separate APA-style
+        entry, joined by ``<br>``.
 
-        # Other types of citation formats
-        tool_type_display = {
-            "run_code": "Code Execution",
-        }.get(tool_type, tool_type)
+        APA pattern used: ``Authors (Year). *Title*. arXiv. <url>``. Fields
+        that are missing are skipped without leaving stray punctuation.
+        """
+        papers: list[dict[str, Any]] = list(citation.get("papers") or [])
+        if not papers:
+            # Fallback for citations that only carry top-level fields.
+            fallback = {
+                "title": citation.get("title", ""),
+                "authors": citation.get("authors", ""),
+                "year": citation.get("year", ""),
+                "url": citation.get("url", ""),
+                "arxiv_id": citation.get("arxiv_id", ""),
+            }
+            if any(fallback.values()):
+                papers = [fallback]
+        entries: list[str] = []
+        for paper in papers:
+            entry = self._format_one_apa(paper)
+            if entry:
+                entries.append(entry)
+        if not entries:
+            return None
+        return "<br>".join(entries)
 
-        query = citation.get("query", "")
-        return f"{tool_type_display}: {query}"
+    @staticmethod
+    def _format_one_apa(paper: dict[str, Any]) -> str | None:
+        authors_raw = paper.get("authors") or paper.get("authors_list") or ""
+        if isinstance(authors_raw, list):
+            authors = ", ".join(str(a) for a in authors_raw[:3] if a)
+            if len(authors_raw) > 3:
+                authors += " et al."
+        else:
+            authors = str(authors_raw).strip()
+        year = str(paper.get("year") or "").strip()
+        title = str(paper.get("title") or "").strip()
+        url = str(paper.get("url") or "").strip()
+        arxiv_id = str(paper.get("arxiv_id") or "").strip()
+        if not (title or authors):
+            return None
+        if not url and arxiv_id:
+            url = f"https://arxiv.org/abs/{arxiv_id}"
+
+        pieces: list[str] = []
+        if authors:
+            pieces.append(html.escape(authors))
+        if year:
+            pieces.append(f"({html.escape(year)}).")
+        elif pieces:
+            pieces[-1] = pieces[-1] + "."
+        if title:
+            pieces.append(f"<em>{html.escape(title)}</em>.")
+        pieces.append("arXiv.")
+        if url:
+            safe_url = html.escape(url, quote=True)
+            pieces.append(f'<a href="{safe_url}">{html.escape(url)}</a>')
+        return " ".join(pieces)
+
+    @staticmethod
+    def _format_web_search_with_links(citation: dict[str, Any]) -> str:
+        query = str(citation.get("query") or "").strip()
+        web_sources = citation.get("web_sources") or []
+        head = "Web Search"
+        if query:
+            head = f"Web Search: {html.escape(query)}"
+        link_items: list[str] = []
+        for source in web_sources:
+            url = str(source.get("url") or "").strip()
+            if not url:
+                continue
+            safe_url = html.escape(url, quote=True)
+            title = str(source.get("title") or "").strip() or url
+            link_items.append(f'<a href="{safe_url}">{html.escape(title)}</a>')
+        if not link_items:
+            return head
+        return head + "<br>" + "<br>".join(link_items)
 
     # ========== Reference Number Mapping Methods ==========
 
@@ -769,21 +897,11 @@ class CitationManager:
         tool_type: str,
         tool_trace: Any,
         raw_answer: str,
+        tool_metadata: dict[str, Any] | None = None,
     ) -> bool:
-        """
-        Thread-safe async version of add_citation for parallel mode
-
-        Args:
-            citation_id: Citation ID
-            tool_type: Tool type
-            tool_trace: ToolTrace object
-            raw_answer: Raw answer (JSON string)
-
-        Returns:
-            Whether addition was successful
-        """
+        """Thread-safe async version of :meth:`add_citation`."""
         async with self._lock:
-            return self.add_citation(citation_id, tool_type, tool_trace, raw_answer)
+            return self.add_citation(citation_id, tool_type, tool_trace, raw_answer, tool_metadata)
 
 
 __all__ = ["CitationManager"]

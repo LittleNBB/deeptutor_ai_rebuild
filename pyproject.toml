@@ -7,13 +7,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deeptutor"
-version = "1.0.0"
+dynamic = ["version", "optional-dependencies"]
 description = "An agent-native intelligent learning companion with multi-agent collaboration and RAG"
-requires-python = ">=3.11"
+# Python 3.14 is supported by the core app now that compiled base dependencies
+# such as FAISS publish compatible wheels. Keep a forward cap so a future
+# interpreter is not advertised before the compiled dependency stack is ready.
+# Individual optional integrations may carry tighter markers below.
+requires-python = ">=3.11,<3.15"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
-    "python-dotenv>=1.0.0",
     "PyYAML>=6.0",
     "jinja2>=3.1.0",
     "openai>=1.30.0",
@@ -26,117 +29,107 @@ dependencies = [
     "tenacity>=8.0.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
+    "packaging>=24.2",
+    "jsonschema>=4.20.0,<5.0.0",
     "aiosqlite>=0.19.0",
-    "typer[all]>=0.9.0",
+    "typer>=0.9.0",
     "rich>=13.0.0",
+    "markdown-it-py>=3.0.0,<5.0.0",
     "prompt_toolkit>=3.0.36",
+    "pyte>=0.8.1",
+    "mcp>=1.26.0,<2.0.0",
+    "tzdata>=2024.1",
+    "loguru>=0.7.3,<1.0.0",
+    "json-repair>=0.57.0,<1.0.0",
+    "psutil>=5.9.0,<8.0.0",
+    "python-docx>=1.1.0",
+    "openpyxl>=3.1.0"
 ]
 
 [project.scripts]
 deeptutor = "deeptutor_cli.main:main"
 
-[project.optional-dependencies]
-# Full CLI: RAG (LlamaIndex), document parsing, and LLM provider SDKs.
-# Mirrors requirements/cli.txt — keep in sync.
-cli = [
-    # LLM provider SDKs
-    "anthropic>=0.30.0",
-    "dashscope>=1.14.0",
-    "perplexityai>=0.1.0",
-    "oauth-cli-kit>=0.1.1; python_version >= '3.11'",
-    # RAG (LlamaIndex)
-    "llama-index>=0.14.12",
-    "PyMuPDF>=1.26.0",
-    "numpy>=1.24.0,<3.0.0",
-    "arxiv>=2.0.0",
-    # Document text extraction (chat attachments)
-    "python-docx>=1.1.0",
-    "openpyxl>=3.1.0",
-    "python-pptx>=1.0.0",
-    "pypdf>=4.0.0",
-    "defusedxml>=0.7.1",
-]
-
-# Web/API server (CLI + FastAPI). Mirrors requirements/server.txt.
-# loguru / json-repair live here (not in [tutorbot]) because provider_core
-# imports them unconditionally — needed by every server install path.
-server = [
-    "deeptutor[cli]",
-    "fastapi>=0.100.0",
-    "uvicorn[standard]>=0.24.0",
-    "websockets>=12.0",
-    "python-multipart>=0.0.6",
-    "bcrypt>=4.0.0",
-    "python-jose[cryptography]>=3.3.0",
-    "pocketbase>=0.12.0",
-    "loguru>=0.7.3,<1.0.0",
-    "json-repair>=0.57.0,<1.0.0",
-]
-
-# TutorBot agent engine + channel SDKs. Mirrors requirements/tutorbot.txt.
-tutorbot = [
-    "deeptutor[server]",
-    "croniter>=6.0.0,<7.0.0",
-    "tiktoken>=0.12.0,<1.0.0",
-    "chardet>=3.0.2,<6.0.0",
-    "mcp>=1.26.0,<2.0.0",
-    "readability-lxml>=0.8.4,<1.0.0",
-    "python-telegram-bot[socks]>=22.6,<23.0",
-    "lark-oapi>=1.5.0,<2.0.0",
-    "dingtalk-stream>=0.24.0,<1.0.0",
-    "slack-sdk>=3.39.0,<4.0.0",
-    "slackify-markdown>=0.2.0,<1.0.0",
-    "qq-botpy>=1.2.0,<2.0.0",
-    "python-socketio>=5.16.0,<6.0.0",
-    "msgpack>=1.1.0,<2.0.0",
-    "python-socks[asyncio]>=2.8.0,<3.0.0",
-    "socksio>=1.0.0,<2.0.0",
-    "websocket-client>=1.9.0,<2.0.0",
-]
-
-# Matrix (Element) channel for TutorBot. Mirrors requirements/matrix.txt.
-# Kept as a separate extra because matrix-nio[e2e] requires libolm (native dep).
-matrix = [
-    "matrix-nio[e2e]>=0.25.2,<1.0.0",
-    "mistune>=3.0.0,<4.0.0",
-    "nh3>=0.2.18,<1.0.0",
-]
-
-# Math Animator addon (Manim). Mirrors requirements/math-animator.txt.
-# System prerequisites (installed outside pip): LaTeX, pkg-config, cairo, cmake, ffmpeg.
-math-animator = ["manim>=0.19.0"]
-
-# Dev/test tooling. Mirrors requirements/dev.txt.
-dev = [
-    "deeptutor[server]",
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.23.0",
-    "pre-commit>=3.0.0",
-    "safety<3.0.0",
-    "bandit>=1.8.0",
-]
-
-# Everything: server + tutorbot + matrix + math-animator + dev tools.
-all = [
-    "deeptutor[tutorbot]",
-    "deeptutor[matrix]",
-    "deeptutor[math-animator]",
-    "deeptutor[dev]",
-]
+[tool.deeptutor.optional-dependencies]
+# Optional modules own their code and dependencies. Full is an installation profile.
+cli = []
+codebuddy = ["codebuddy-agent-sdk>=0.3,<0.4"]
+claude-code = ["claude-agent-sdk>=0.2.174,<0.3"]
+video-learning = ["deeptutor-reading=={version}"]
+edge-tts = ["edge-tts>=7.0,<8.0"]
+video-lesson = ["deeptutor-video-lesson=={version}", "edge-tts>=7.0,<8.0"]
+server = ["deeptutor-server=={version}"]
+partners = ["deeptutor-partners=={version}"]
+parse-markitdown = ["deeptutor-parser-markitdown=={version}"]
+parse-docling = ["deeptutor-parser-docling=={version}"]
+parse-pymupdf4llm = ["deeptutor-parser-pymupdf4llm=={version}"]
+parse-liteparse = ["deeptutor-parser-liteparse=={version}"]
+parse = ["deeptutor[parse-markitdown]=={version}", "deeptutor[parse-docling]=={version}", "deeptutor[parse-pymupdf4llm]=={version}", "deeptutor[parse-liteparse]=={version}"]
+tutorbot = ["deeptutor[partners]=={version}"]
+matrix = ["matrix-nio>=0.25.2,<1.0.0", "mistune>=3.0.0,<4.0.0", "nh3>=0.2.18,<1.0.0"]
+matrix-e2e = ["deeptutor[matrix]=={version}", "matrix-nio[e2e]>=0.25.2,<1.0.0"]
+math-animator = ["deeptutor-renderer-manim=={version}"]
+graphrag = ["graphrag>=3.0.1,<4.0.0; python_version < '3.14'"]
+rag-lightrag = ["lightrag-hku==1.5.7"]
+rag-rerank = ["sentence-transformers>=3.0.0,<6.0.0; python_version < '3.14'"]
+guard = ["fastapi-guard>=8.1.1,<9.0.0"]
+dev = ["deeptutor[server]=={version}", "pytest>=7.0.0", "pytest-asyncio>=0.23.0", "pre-commit>=3.0.0", "safety<3.0.0", "bandit>=1.8.0", "import-linter>=2.1.0,<3.0.0", "python-docx>=1.1.0", "openpyxl>=3.1.0", "python-pptx>=1.0.0", "pypdf>=4.0.0", "defusedxml>=0.7.1"]
+all = ["deeptutor[full,math-animator,dev]=={version}"]
+audio-overview = ["deeptutor-audio-overview=={version}"]
+solve = ["deeptutor-solve=={version}"]
+reading = ["deeptutor-reading=={version}"]
+memory = ["deeptutor-memory=={version}"]
+providers = ["deeptutor-providers=={version}"]
+questions = ["deeptutor-questions=={version}"]
+notebook = ["deeptutor-notebook=={version}"]
+web = ["deeptutor-web=={version}"]
+parsing = ["deeptutor-parsing=={version}"]
+books = ["deeptutor-books=={version}"]
+research = ["deeptutor-research=={version}"]
+visualize = ["deeptutor-visualize=={version}"]
+renderer-manim = ["deeptutor-renderer-manim=={version}"]
+calendar = ["deeptutor-calendar=={version}"]
+knowledge = ["deeptutor-knowledge=={version}"]
+co-writer = ["deeptutor-co-writer=={version}"]
+mastery = ["deeptutor-mastery=={version}"]
+full = ["deeptutor-audio-overview=={version}", "deeptutor-solve=={version}", "deeptutor-server=={version}", "deeptutor-reading=={version}", "deeptutor-partners=={version}", "deeptutor-memory=={version}", "deeptutor-providers=={version}", "deeptutor-questions=={version}", "deeptutor-notebook=={version}", "deeptutor-web=={version}", "deeptutor-video-lesson=={version}", "deeptutor-parsing=={version}", "deeptutor-books=={version}", "deeptutor-research=={version}", "deeptutor-visualize=={version}", "deeptutor-calendar=={version}", "deeptutor-knowledge=={version}", "deeptutor-co-writer=={version}", "deeptutor-mastery=={version}"]
 
 [tool.setuptools]
 include-package-data = true
 
+[tool.setuptools.dynamic]
+version = {attr = "deeptutor.__version__.__version__"}
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["deeptutor*", "deeptutor_cli*"]
+
+[tool.setuptools.package-data]
+# Runtime data shipped inside the deeptutor package: prompt YAMLs (loaded by
+# PromptManager from PACKAGE_ROOT/deeptutor/.../prompts/*.yaml), markdown
+# templates (builtin SKILL.md files, vision_solver prompts), and helper shell
+# scripts. Without these, ``pip install deeptutor`` ships a wheel missing
+# every agent prompt and capability fails at first use.
+deeptutor = [
+    "**/*.yaml",
+    "**/*.yml",
+    "**/*.md",
+    "**/*.json",
+    "**/*.sh",
+    "**/*.j2",
+    "**/*.jinja",
+    "**/*.ts",
+    "**/*.tsx",
+    "**/*.mjs",
+]
+deeptutor_cli = ["**/*.md"]
+deeptutor_web = ["**/*", ".next/**/*"]
 
 # ============================================
 # Black code formatter configuration
 # ============================================
 [tool.black]
 line-length = 100
-target-version = ['py311', 'py312']
+target-version = ['py311', 'py312', 'py313', 'py314']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
@@ -282,17 +275,21 @@ max-complexity = 10
 # Pytest configuration
 # ============================================
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "deeptutor/learning/tests"]
 pythonpath = ["."]
 markers = [
     "asyncio: mark async tests that require pytest-asyncio",
+    "integration: requires explicitly configured external services",
+    "redis_integration: requires DEEPTUTOR_TEST_REDIS_URL",
+    "real_llm_resolver: exercises LLM config resolution itself, so it keeps the real resolver",
 ]
 asyncio_default_fixture_loop_scope = "function"
 addopts = [
     "--strict-markers",
     "--strict-config",
     "--disable-warnings",
-    "--tb=short"
+    "--tb=short",
+    "--import-mode=importlib",
 ]
 
 # ============================================

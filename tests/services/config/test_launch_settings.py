@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from deeptutor.services.config.launch_settings import load_launch_settings
 
 
@@ -12,19 +14,17 @@ def _settings_dir(root: Path) -> Path:
     return path
 
 
-def test_launch_settings_reads_ports_from_env_and_ignores_legacy_env_json(
+def test_launch_settings_reads_ports_from_system_json_and_ignores_env_json(
     monkeypatch, tmp_path: Path
 ) -> None:
     for key in ("BACKEND_PORT", "FRONTEND_PORT", "UI_LANGUAGE", "LANGUAGE"):
         monkeypatch.delenv(key, raising=False)
 
-    (tmp_path / ".env").write_text(
-        "BACKEND_PORT=9001\nFRONTEND_PORT=4000\nUI_LANGUAGE=en\n",
+    settings_dir = _settings_dir(tmp_path)
+    (settings_dir / "system.json").write_text(
+        json.dumps({"backend_port": 9001, "frontend_port": 4000}),
         encoding="utf-8",
     )
-    settings_dir = _settings_dir(tmp_path)
-    # Legacy file may exist on older installs, but launcher ports now come
-    # exclusively from .env / process env / defaults.
     (settings_dir / "env.json").write_text(
         json.dumps({"ports": {"backend": 8101, "frontend": 4100}}),
         encoding="utf-8",
@@ -39,12 +39,55 @@ def test_launch_settings_reads_ports_from_env_and_ignores_legacy_env_json(
     assert settings.backend_port == 9001
     assert settings.frontend_port == 4000
     assert settings.language == "zh"
-    assert ".env" in settings.source
+    assert "system.json" in settings.source
     assert "env.json" not in settings.source
     assert "interface.json" in settings.source
 
 
-def test_launch_settings_fall_back_to_env_when_interface_settings_missing(
+@pytest.mark.parametrize(
+    ("stored_language", "expected"),
+    [
+        ("french", "fr"),
+        ("fr-FR", "fr"),
+        ("ukrainian", "uk"),
+        ("uk_UA", "uk"),
+        ("uk-UA", "uk"),
+        ("polish", "pl"),
+        ("polski", "pl"),
+        ("pl-PL", "pl"),
+        ("turkish", "tr"),
+        ("tr-TR", "tr"),
+        ("vietnamese", "vi"),
+        ("tiếng việt", "vi"),
+        ("vi-VN", "vi"),
+        ("vi_VN", "vi"),
+        ("japanese", "ja"),
+        ("ja-JP", "ja"),
+    ],
+)
+def test_launch_settings_reads_supported_languages_from_interface_json(
+    monkeypatch, tmp_path: Path, stored_language: str, expected: str
+) -> None:
+    for key in ("BACKEND_PORT", "FRONTEND_PORT", "UI_LANGUAGE", "LANGUAGE"):
+        monkeypatch.delenv(key, raising=False)
+
+    settings_dir = _settings_dir(tmp_path)
+    (settings_dir / "system.json").write_text(
+        json.dumps({"backend_port": 8001, "frontend_port": 3782}),
+        encoding="utf-8",
+    )
+    (settings_dir / "interface.json").write_text(
+        json.dumps({"language": stored_language}),
+        encoding="utf-8",
+    )
+
+    settings = load_launch_settings(tmp_path)
+
+    assert settings.language == expected
+    assert "interface.json" in settings.source
+
+
+def test_launch_settings_creates_default_system_json_without_dotenv_migration(
     monkeypatch, tmp_path: Path
 ) -> None:
     for key in ("BACKEND_PORT", "FRONTEND_PORT", "UI_LANGUAGE", "LANGUAGE"):
@@ -57,25 +100,22 @@ def test_launch_settings_fall_back_to_env_when_interface_settings_missing(
 
     settings = load_launch_settings(tmp_path)
 
-    assert settings.backend_port == 9101
-    assert settings.frontend_port == 4200
-    assert settings.source == ".env"
-    assert settings.language == "zh"
+    assert settings.backend_port == 8001
+    assert settings.frontend_port == 3782
+    assert settings.system_json_path.exists()
+    assert settings.language == "en"
 
 
-def test_launch_settings_fall_back_per_invalid_env_port(monkeypatch, tmp_path: Path) -> None:
+def test_launch_settings_allows_process_env_as_deployment_override(
+    monkeypatch, tmp_path: Path
+) -> None:
     for key in ("BACKEND_PORT", "FRONTEND_PORT", "UI_LANGUAGE", "LANGUAGE"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("BACKEND_PORT", "9201")
     monkeypatch.setenv("FRONTEND_PORT", "4300")
 
-    (tmp_path / ".env").write_text(
-        "BACKEND_PORT=not-a-port\nFRONTEND_PORT=70000\n",
-        encoding="utf-8",
-    )
-
     settings = load_launch_settings(tmp_path)
 
     assert settings.backend_port == 9201
     assert settings.frontend_port == 4300
-    assert settings.source == "environment"
+    assert "environment" in settings.source

@@ -2,26 +2,30 @@
 
 from __future__ import annotations
 
+from importlib import import_module
+from pathlib import Path
+import sys
+
 import typer
 
 from deeptutor.logging import configure_logging
+from deeptutor.modules.catalog import manifests, module_enabled
 from deeptutor.runtime.mode import RunMode, set_mode
-from deeptutor.services.setup import get_backend_port
 
-from .book import register as register_book
-from .bot import register as register_bot
 from .chat import register as register_chat
 from .common import build_turn_request, console, maybe_run
 from .config_cmd import register as register_config
-from .kb import register as register_kb
-from .memory import register as register_memory
-from .notebook import register as register_notebook
+from .doctor import register as register_doctor
+from .init_cmd import register as register_init
+from .module import register as register_module
 from .plugin import register as register_plugin
 from .provider_cmd import register as register_provider
 from .session_cmd import register as register_session
+from .skill import register as register_skill
+from .workspace_cmd import register as register_workspace
 
 set_mode(RunMode.CLI)
-configure_logging()
+configure_logging(console_stream=sys.stderr)
 
 app = typer.Typer(
     name="deeptutor",
@@ -30,48 +34,60 @@ app = typer.Typer(
     add_completion=False,
 )
 
-bot_app = typer.Typer(help="Manage TutorBot instances.")
 chat_app = typer.Typer(help="Interactive chat REPL.")
-kb_app = typer.Typer(help="Manage knowledge bases.")
-memory_app = typer.Typer(help="View and manage lightweight memory.")
+skill_app = typer.Typer(help="Manage skills and install from hubs (ClawHub, …).")
 plugin_app = typer.Typer(help="List plugins.")
-config_app = typer.Typer(help="Inspect configuration.")
+config_app = typer.Typer(help="Inspect and apply configuration.")
 session_app = typer.Typer(help="Manage shared sessions.")
-notebook_app = typer.Typer(help="Manage notebooks and imported markdown records.")
 provider_app = typer.Typer(help="Manage provider OAuth login.")
-book_app = typer.Typer(help="Manage interactive Books (BookEngine).")
+workspace_app = typer.Typer(help="Manage the user content workspace.")
 
-app.add_typer(bot_app, name="bot")
 app.add_typer(chat_app, name="chat")
-app.add_typer(kb_app, name="kb")
-app.add_typer(memory_app, name="memory")
+app.add_typer(skill_app, name="skill")
+app.add_typer(skill_app, name="skills")  # alias: `deeptutor skills …`
 app.add_typer(plugin_app, name="plugin")
 app.add_typer(config_app, name="config")
 app.add_typer(session_app, name="session")
-app.add_typer(notebook_app, name="notebook")
 app.add_typer(provider_app, name="provider")
-app.add_typer(book_app, name="book")
+app.add_typer(workspace_app, name="workspace")
 
-register_bot(bot_app)
 register_chat(chat_app)
-register_kb(kb_app)
-register_memory(memory_app)
+register_skill(skill_app)
 register_plugin(plugin_app)
 register_config(config_app)
 register_session(session_app)
-register_notebook(notebook_app)
 register_provider(provider_app)
-register_book(book_app)
+register_workspace(workspace_app)
+for owner, module in manifests().items():
+    if not module_enabled(owner):
+        continue
+    for command in module["commands"]:
+        group = typer.Typer(help=command["help"])
+        module_path, attribute = command["register"].split(":", 1)
+        getattr(import_module(module_path), attribute)(group)
+        app.add_typer(group, name=command["name"])
+
+register_doctor(app)
+register_init(app)
+module_app = typer.Typer(help="Install, remove and inspect optional modules.")
+app.add_typer(module_app, name="module")
+register_module(module_app)
 
 
 @app.command("run")
 def run_capability(
     capability: str = typer.Argument(
         ...,
-        help="Capability name (e.g. chat, deep_solve, deep_question, deep_research, math_animator).",
+        help=(
+            "Capability name (e.g. chat, deep_solve, deep_question, "
+            "deep_research, visualize, math_animator, mastery_path)."
+        ),
     ),
     message: str = typer.Argument(..., help="Message to send."),
     session: str | None = typer.Option(None, "--session", help="Existing session id."),
+    workspace: str | None = typer.Option(
+        None, "--workspace", help="Registered workspace id; omit for default."
+    ),
     tool: list[str] = typer.Option([], "--tool", "-t", help="Enabled tool(s)."),
     kb: list[str] = typer.Option([], "--kb", help="Knowledge base name."),
     notebook_ref: list[str] = typer.Option([], "--notebook-ref", help="Notebook references."),
@@ -100,20 +116,68 @@ def run_capability(
         notebook_refs=notebook_ref,
         history_refs=history_ref,
     )
-    maybe_run(run_turn_and_render(app=DeepTutorApp(), request=request, fmt=fmt))
+    client = DeepTutorApp(workspace_id=workspace) if workspace is not None else DeepTutorApp()
+    maybe_run(run_turn_and_render(app=client, request=request, fmt=fmt))
+
+
+@app.command()
+def start(
+    home: Path | None = typer.Option(None, "--home", help="Runtime workspace root."),
+    dev: bool = typer.Option(
+        False,
+        "--dev",
+        help="Use the Next.js development server for frontend work.",
+    ),
+    detach: bool = typer.Option(
+        False,
+        "--detach",
+        help="Run outside the current console; stop later with `deeptutor stop`.",
+    ),
+    open_browser: bool = typer.Option(
+        True,
+        "--open-browser/--no-browser",
+        help="Open the frontend automatically after startup.",
+    ),
+) -> None:
+    """Launch backend + frontend together. Source installs default to production."""
+    from deeptutor.modules.catalog import require_module
+
+    require_module("server")
+    require_module("web")
+    from deeptutor.runtime.launcher import start as start_web
+
+    start_web(home=home, dev=dev, detach=detach, open_browser=open_browser)
+
+
+@app.command()
+def stop(
+    home: Path | None = typer.Option(None, "--home", help="Runtime workspace root."),
+) -> None:
+    """Stop a DeepTutor launcher started with ``--detach``."""
+    from deeptutor.runtime.launcher import stop as stop_web
+
+    if not stop_web(home=home):
+        raise typer.Exit(code=1)
 
 
 @app.command()
 def serve(
     host: str = typer.Option("0.0.0.0", help="Bind address."),
-    port: int = typer.Option(get_backend_port(), help="Port number."),
+    port: int | None = typer.Option(None, help="Port number."),
     reload: bool = typer.Option(False, help="Enable auto-reload for development."),
 ) -> None:
     """Start the DeepTutor API server."""
     import asyncio
     import sys
 
+    from deeptutor.modules.catalog import require_module
+
+    require_module("server")
     set_mode(RunMode.SERVER)
+    if port is None:
+        from deeptutor.services.setup import get_backend_port
+
+        port = get_backend_port()
 
     # Windows: uvicorn defaults to SelectorEventLoop which does not support
     # asyncio.create_subprocess_exec.  Switch to ProactorEventLoop so that
@@ -126,16 +190,36 @@ def serve(
     except ImportError:
         console.print(
             "[bold red]Error:[/] API server dependencies not installed.\n"
-            "Run: pip install -e '.[server]'"
+            "Run: deeptutor module install server"
         )
         raise typer.Exit(code=1)
 
+    from deeptutor.services.config import (
+        HTTP_KEEP_ALIVE_TIMEOUT,
+        get_ws_max_size,
+        load_system_settings,
+    )
+
+    backend_workers = max(1, int(load_system_settings().get("backend_workers") or 1))
+    if reload and backend_workers > 1:
+        console.print("[bold red]Error:[/] --reload cannot be used when backend_workers > 1.")
+        raise typer.Exit(code=2)
+
+    # ws_max_size tracks the configured chat-attachment total so base64
+    # uploads fit in one WS frame (uvicorn defaults to 16MB).
     uvicorn.run(
         "deeptutor.api.main:app",
         host=host,
         port=port,
         reload=reload,
+        workers=backend_workers,
         reload_excludes=["web/*", "data/*"] if reload else None,
+        # Keep request.client tied to the actual peer; XFF is client-controlled
+        # unless the deployment explicitly provides a trusted proxy.
+        proxy_headers=False,
+        ws_max_size=get_ws_max_size(),
+        timeout_keep_alive=HTTP_KEEP_ALIVE_TIMEOUT,
+        timeout_graceful_shutdown=1,
     )
 
 

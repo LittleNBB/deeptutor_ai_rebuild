@@ -5,7 +5,7 @@ from __future__ import annotations
 from _pytest.monkeypatch import MonkeyPatch
 import pytest
 
-from deeptutor.services.llm.client import LLMClient
+from deeptutor.services.llm.client import LLMClient, build_model_func_for_config
 from deeptutor.services.llm.config import LLMConfig
 
 
@@ -43,6 +43,21 @@ def test_client_complete_sync(monkeypatch: MonkeyPatch) -> None:
     assert client.complete_sync("hello") == "ok"
 
 
+def test_client_reports_multimodal_image_support() -> None:
+    assert (
+        LLMClient(
+            LLMConfig(model="gpt-4o", api_key="key", base_url="https://example.com")
+        ).supports_multimodal_images()
+        is True
+    )
+    assert (
+        LLMClient(
+            LLMConfig(model="gpt-3.5-turbo", api_key="key", base_url="https://example.com")
+        ).supports_multimodal_images()
+        is False
+    )
+
+
 @pytest.mark.asyncio
 async def test_client_complete_sync_running_loop() -> None:
     """complete_sync should raise when called from a running event loop."""
@@ -55,7 +70,7 @@ async def test_client_complete_sync_running_loop() -> None:
 
 @pytest.mark.asyncio
 async def test_client_get_model_func_uses_factory(monkeypatch: MonkeyPatch) -> None:
-    """get_model_func should return async callable that delegates to factory."""
+    """get_model_func should append prompt after history messages."""
     config = LLMConfig(model="model", api_key="key", base_url="https://example.com")
     client = LLMClient(config)
 
@@ -65,7 +80,7 @@ async def test_client_get_model_func_uses_factory(monkeypatch: MonkeyPatch) -> N
         captured.update(kwargs)
         return "ok"
 
-    monkeypatch.setattr("deeptutor.services.llm.factory.complete", _fake_complete)
+    monkeypatch.setattr("deeptutor.services.llm.factory.complete_with_config", _fake_complete)
 
     func = client.get_model_func()
     result = await func(
@@ -75,9 +90,63 @@ async def test_client_get_model_func_uses_factory(monkeypatch: MonkeyPatch) -> N
     )
 
     assert result == "ok"
+    assert captured["config"] is config
     assert captured["prompt"] == "hello"
     assert captured["system_prompt"] == "sys"
-    assert captured["messages"] == [{"role": "user", "content": "old"}]
+    assert captured["messages"] == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old"},
+        {"role": "user", "content": "hello"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_client_get_model_func_empty_history_uses_prompt(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Empty history_messages must not override the current prompt."""
+    config = LLMConfig(model="model", api_key="key", base_url="https://example.com")
+    client = LLMClient(config)
+
+    captured: dict[str, object] = {}
+
+    async def _fake_complete(**kwargs: object) -> str:
+        captured.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr("deeptutor.services.llm.factory.complete_with_config", _fake_complete)
+
+    func = client.get_model_func()
+    result = await func("hello", system_prompt="sys", history_messages=[])
+
+    assert result == "ok"
+    assert captured["prompt"] == "hello"
+    assert captured["system_prompt"] == "sys"
+    assert captured["messages"] is None
+
+
+@pytest.mark.asyncio
+async def test_client_get_model_func_explicit_messages_override_prompt(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Explicit messages are already complete and should pass through as-is."""
+    config = LLMConfig(model="model", api_key="key", base_url="https://example.com")
+    client = LLMClient(config)
+
+    captured: dict[str, object] = {}
+
+    async def _fake_complete(**kwargs: object) -> str:
+        captured.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr("deeptutor.services.llm.factory.complete_with_config", _fake_complete)
+
+    messages = [{"role": "user", "content": "from messages"}]
+    func = client.get_model_func()
+    result = await func("", system_prompt="sys", messages=messages)
+
+    assert result == "ok"
+    assert captured["messages"] == messages
 
 
 @pytest.mark.asyncio
@@ -92,7 +161,7 @@ async def test_client_get_vision_model_func_uses_factory(monkeypatch: MonkeyPatc
         captured.update(kwargs)
         return "ok"
 
-    monkeypatch.setattr("deeptutor.services.llm.factory.complete", _fake_complete)
+    monkeypatch.setattr("deeptutor.services.llm.factory.complete_with_config", _fake_complete)
 
     func = client.get_vision_model_func()
     result = await func(
@@ -105,3 +174,27 @@ async def test_client_get_vision_model_func_uses_factory(monkeypatch: MonkeyPatc
     assert captured["prompt"] == "hello"
     assert captured["messages"] == [{"role": "user", "content": "hi"}]
     assert captured["image_data"] == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_explicit_config_model_func_does_not_mutate_process_environment(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    config = LLMConfig(
+        model="snapshot-model",
+        api_key="snapshot-key",
+        base_url="https://snapshot.example.com/v1",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "global-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://global.example.com/v1")
+
+    async def _fake_complete(**kwargs: object) -> str:
+        assert kwargs["config"] is config
+        return "ok"
+
+    monkeypatch.setattr("deeptutor.services.llm.factory.complete_with_config", _fake_complete)
+
+    func = build_model_func_for_config(config, allow_multimodal=False)
+    assert await func("hello") == "ok"
+    assert __import__("os").environ["OPENAI_API_KEY"] == "global-key"
+    assert __import__("os").environ["OPENAI_BASE_URL"] == "https://global.example.com/v1"

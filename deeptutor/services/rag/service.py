@@ -2,26 +2,35 @@
 
 from __future__ import annotations
 
+import contextlib
+import importlib
 import logging
 import os
 from pathlib import Path
 import shutil
 from typing import Any, Dict, List, Optional
 
-from .factory import DEFAULT_PROVIDER, get_pipeline, list_pipelines
+from deeptutor.runtime.home import get_runtime_data_root
 
-DEFAULT_KB_BASE_DIR = str(
-    Path(__file__).resolve().parent.parent.parent.parent / "data" / "knowledge_bases"
-)
+from .embedding_binding import with_kb_embedding
+from .factory import DEFAULT_PROVIDER, get_pipeline, list_pipelines, normalize_provider_name
+from .provider_binding import resolve_bound_provider
+
+DEFAULT_KB_BASE_DIR = str(get_runtime_data_root() / "knowledge_bases")
 
 
 class RAGService:
-    """Unified RAG service backed by the LlamaIndex pipeline."""
+    """Unified RAG service that routes to a KB's bound pipeline.
+
+    The provider is resolved per knowledge base: an explicit ``provider`` passed
+    to the constructor wins (used at create time); otherwise it is read from
+    DeepTutor's authoritative KB config, with metadata as a legacy fallback.
+    """
 
     def __init__(
         self,
         kb_base_dir: Optional[str] = None,
-        provider: Optional[str] = None,  # accepted for backward compatibility
+        provider: Optional[str] = None,
     ):
         self.logger = logging.getLogger(__name__)
         if kb_base_dir is None:
@@ -38,34 +47,127 @@ class RAGService:
                 )
                 kb_base_dir = DEFAULT_KB_BASE_DIR
         self.kb_base_dir = kb_base_dir
-        self.provider = DEFAULT_PROVIDER
-        self._pipeline = None
+        self._provider_override = normalize_provider_name(provider) if provider else None
+        # ``self.provider`` kept for callers that read it directly; the real
+        # selection happens per kb_name in ``_resolve_provider``.
+        self.provider = self._provider_override or DEFAULT_PROVIDER
+        self._pipelines: dict[str, Any] = {}
 
-    def _get_pipeline(self):
-        if self._pipeline is None:
-            self._pipeline = get_pipeline(kb_base_dir=self.kb_base_dir)
-        return self._pipeline
+    def _resolve_provider(self, kb_name: Optional[str]) -> str:
+        """Pick the provider for ``kb_name`` from DeepTutor's binding."""
+        if self._provider_override:
+            return self._provider_override
+        return resolve_bound_provider(self.kb_base_dir, kb_name)
 
+    def _get_pipeline(self, provider: str):
+        if provider not in self._pipelines:
+            self._pipelines[provider] = get_pipeline(name=provider, kb_base_dir=self.kb_base_dir)
+        return self._pipelines[provider]
+
+    @with_kb_embedding
     async def initialize(self, kb_name: str, file_paths: List[str], **kwargs) -> bool:
-        self.logger.info(f"Initializing KB '{kb_name}'")
-        pipeline = self._get_pipeline()
-        return await pipeline.initialize(kb_name=kb_name, file_paths=file_paths, **kwargs)
+        return await self._index(kb_name, file_paths, "initialize", kwargs)
 
+    @with_kb_embedding
     async def add_documents(self, kb_name: str, file_paths: List[str], **kwargs) -> bool:
-        self.logger.info(f"Adding {len(file_paths)} document(s) to KB '{kb_name}'")
-        pipeline = self._get_pipeline()
-        if not hasattr(pipeline, "add_documents"):
-            return await pipeline.initialize(kb_name=kb_name, file_paths=file_paths, **kwargs)
-        return await pipeline.add_documents(kb_name=kb_name, file_paths=file_paths, **kwargs)
+        return await self._index(kb_name, file_paths, "add_documents", kwargs)
 
+    async def _index(self, kb_name, file_paths, method, kwargs):
+        from deeptutor.knowledge.indexing_run import IndexingRun, current_run
+
+        from .index_probe import latest_ready_provider_version
+        from .kb_paths import resolve_kb_dir
+
+        provider = self._resolve_provider(kb_name)
+        pipeline = self._get_pipeline(provider)
+        operation = getattr(pipeline, method, None) or pipeline.initialize
+        if current_run() is not None:
+            return await operation(kb_name=kb_name, file_paths=file_paths, **kwargs)
+        task_id = kwargs.pop("task_id", "")
+        async with IndexingRun(
+            resolve_kb_dir(self.kb_base_dir, kb_name),
+            file_paths,
+            task_id=task_id,
+            action="upload" if method == "add_documents" else "rebuild",
+            provider=provider,
+        ) as run:
+            receipt_callback = kwargs.get("indexed_file_callback")
+
+            def indexed(paths):
+                for path in paths:
+                    run.document(Path(path), "completed")
+                if receipt_callback:
+                    receipt_callback(paths)
+
+            kwargs["indexed_file_callback"] = indexed
+            callback = kwargs.get("progress_callback")
+
+            def progress(current, total):
+                run.phase("embedding", current=current, total=total)
+                if callback:
+                    callback(current, total)
+
+            kwargs["progress_callback"] = progress
+            success = await operation(kb_name=kb_name, file_paths=file_paths, **kwargs)
+            if not run.data.get("usable_version"):
+                run.check()
+            if not success:
+                return False
+            version = latest_ready_provider_version(run.kb_dir, provider)
+            if version is None:
+                raise RuntimeError("Index output did not pass the provider readiness check.")
+            partial = any(
+                doc.get("status") in {"failed", "unknown", "pending", "parsing"}
+                for doc in run.data["documents"].values()
+            )
+            run.finish("partial" if partial else "completed", version=version.get("version"))
+            return True
+
+    @with_kb_embedding
     async def search(
         self,
         query: str,
         kb_name: str,
         event_sink=None,
+        rewrite: bool | None = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        kwargs.pop("mode", None)
+        provider = self._resolve_provider(kb_name)
+        from .factory import PAGEINDEX_OSS_PROVIDER, PAGEINDEX_PROVIDER
+
+        if provider in {PAGEINDEX_PROVIDER, PAGEINDEX_OSS_PROVIDER}:
+            message = (
+                "PageIndex uses Reasoning as Retrieval. Read this knowledge base with "
+                "its PageIndex tools inside an agent loop instead of RAGService.search()."
+            )
+            return {
+                "query": query,
+                "answer": message,
+                "content": "",
+                "sources": [],
+                "provider": provider,
+                "error_type": "reasoning_as_retrieval_required",
+            }
+
+        # Query rewrite layer (fail-open). ``maybe_rewrite`` reads runtime
+        # settings when ``rewrite`` is None, honors an explicit True/False
+        # override, and returns ``(original, None)`` when the layer is off, so
+        # provenance is only attached when a rewrite actually ran.
+        from deeptutor.services.rag.query_rewrite import maybe_rewrite
+
+        effective_query, rewrite_outcome = await maybe_rewrite(query, rewrite=rewrite)
+        if rewrite_outcome is not None:
+            await self._emit_tool_event(
+                event_sink,
+                "status",
+                f"Rewritten query: {rewrite_outcome.rewritten}",
+                {
+                    "query": query,
+                    "rewrite_outcome": rewrite_outcome.to_dict(),
+                    "trace_layer": "summary",
+                },
+            )
+
         with self._capture_raw_logs(event_sink):
             await self._emit_tool_event(
                 event_sink,
@@ -75,16 +177,16 @@ class RAGService:
             )
 
             self.logger.info(f"Searching KB '{kb_name}' with query: {query[:50]}...")
-            pipeline = self._get_pipeline()
+            pipeline = self._get_pipeline(provider)
 
             await self._emit_tool_event(
                 event_sink,
                 "status",
                 f"Retrieving from knowledge base '{kb_name}'...",
-                {"provider": DEFAULT_PROVIDER, "trace_layer": "summary"},
+                {"provider": provider, "trace_layer": "summary"},
             )
 
-            result = await pipeline.search(query=query, kb_name=kb_name, **kwargs)
+            result = await pipeline.search(query=effective_query, kb_name=kb_name, **kwargs)
 
             if "query" not in result:
                 result["query"] = query
@@ -92,7 +194,11 @@ class RAGService:
                 result["answer"] = result["content"]
             if "content" not in result and "answer" in result:
                 result["content"] = result["answer"]
-            result["provider"] = DEFAULT_PROVIDER
+            # The service is authoritative about which engine ran (resolved from
+            # the KB's binding), so it overwrites whatever the pipeline reports.
+            result["provider"] = provider
+            if rewrite_outcome is not None:
+                result["query_rewrite"] = rewrite_outcome.to_dict()
 
             if result.get("error_type") or result.get("needs_reindex"):
                 await self._emit_tool_event(
@@ -100,7 +206,7 @@ class RAGService:
                     "status",
                     result.get("answer") or result.get("content") or "RAG search failed.",
                     {
-                        "provider": DEFAULT_PROVIDER,
+                        "provider": provider,
                         "kb_name": kb_name,
                         "trace_layer": "summary",
                         "call_state": "error",
@@ -116,11 +222,30 @@ class RAGService:
                 "status",
                 f"Retrieved {len(answer)} characters of grounded context.",
                 {
-                    "provider": DEFAULT_PROVIDER,
+                    "provider": provider,
                     "kb_name": kb_name,
                     "trace_layer": "summary",
                 },
             )
+
+            # L1 memory trace — best-effort, never blocks the search path.
+            try:
+                from deeptutor.services.memory import get_memory_store
+                from deeptutor.services.memory.trace import TraceEvent
+
+                await get_memory_store().emit(
+                    TraceEvent.new(
+                        "kb",
+                        "query",
+                        {
+                            "query": query,
+                            "kb_name": kb_name,
+                            "answer_chars": len(answer),
+                        },
+                    )
+                )
+            except Exception:
+                pass
 
             return result
 
@@ -136,14 +261,35 @@ class RAGService:
         await event_sink(event_type, message, metadata or {})
 
     def _capture_raw_logs(self, event_sink):
-        from contextlib import nullcontext
-
         if event_sink is None:
-            return nullcontext()
+            return contextlib.nullcontext()
 
-        from deeptutor.logging import capture_process_logs
+        from deeptutor.logging import ProcessLogEvent, capture_process_logs
+        from deeptutor.logging.process_stream import ProcessLogHandler
+
+        def should_skip_noisy_retrieve_log(event: ProcessLogEvent) -> bool:
+            if event.level != "INFO":
+                return False
+            message = event.message.strip()
+            logger_name = event.logger
+            if logger_name == "nano-vectordb" and (
+                message.startswith("Load ") or message.startswith("Init ")
+            ):
+                return True
+            if (
+                logger_name.startswith("deeptutor.services.embedding.")
+                and (
+                    message.startswith("Successfully generated ")
+                    or message.startswith("Generated ")
+                )
+                and "embedding" in message.lower()
+            ):
+                return True
+            return False
 
         def emit(event):
+            if should_skip_noisy_retrieve_log(event):
+                return None
             return self._emit_tool_event(
                 event_sink,
                 "raw_log",
@@ -157,11 +303,39 @@ class RAGService:
                 },
             )
 
-        return capture_process_logs(emit, min_level=logging.INFO)
+        @contextlib.contextmanager
+        def capture_non_propagating_logs():
+            handlers: list[tuple[logging.Logger, logging.Handler]] = []
+            for logger_name in ("lightrag", "graphrag", "graphrag_llm"):
+                if logger_name == "lightrag":
+                    with contextlib.suppress(Exception):
+                        importlib.import_module("lightrag.utils")
+                source_logger = logging.getLogger(logger_name)
+                if source_logger.propagate:
+                    continue
+                handler = ProcessLogHandler(emit, min_level=logging.INFO)
+                source_logger.addHandler(handler)
+                handlers.append((source_logger, handler))
+            try:
+                yield
+            finally:
+                for source_logger, handler in handlers:
+                    if handler in source_logger.handlers:
+                        source_logger.removeHandler(handler)
+                    handler.close()
+
+        @contextlib.contextmanager
+        def capture_all_raw_logs():
+            with capture_process_logs(emit, min_level=logging.INFO):
+                with capture_non_propagating_logs():
+                    yield
+
+        return capture_all_raw_logs()
 
     async def delete(self, kb_name: str) -> bool:
-        self.logger.info(f"Deleting KB '{kb_name}'")
-        pipeline = self._get_pipeline()
+        provider = self._resolve_provider(kb_name)
+        self.logger.info(f"Deleting KB '{kb_name}' (provider={provider})")
+        pipeline = self._get_pipeline(provider)
 
         if hasattr(pipeline, "delete"):
             return await pipeline.delete(kb_name=kb_name)
@@ -195,11 +369,11 @@ class RAGService:
 
     @staticmethod
     def get_current_provider() -> str:
-        # ``RAG_PROVIDER`` env var is honoured for visibility but the
-        # service only ships with a single backend.
-        os.getenv("RAG_PROVIDER")
-        return DEFAULT_PROVIDER
+        # Global default; per-KB selection happens in ``_resolve_provider``.
+        return normalize_provider_name(os.getenv("RAG_PROVIDER"))
 
     @staticmethod
     def has_provider(name: str) -> bool:
-        return (name or "").strip().lower() == DEFAULT_PROVIDER
+        from .factory import KNOWN_PROVIDERS
+
+        return (name or "").strip().lower() in KNOWN_PROVIDERS

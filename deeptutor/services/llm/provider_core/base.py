@@ -6,7 +6,9 @@ from abc import ABC, abstractmethod
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+import inspect
 import json
+import re
 from typing import Any
 
 from loguru import logger
@@ -51,6 +53,7 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None
     thinking_blocks: list[dict[str, Any]] | None = None
+    provider_specific_fields: dict[str, Any] = field(default_factory=dict)
 
     @property
     def has_tool_calls(self) -> bool:
@@ -72,20 +75,35 @@ class LLMProvider(ABC):
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
     _TRANSIENT_ERROR_MARKERS = (
-        "429",
         "rate limit",
-        "500",
-        "502",
-        "503",
-        "504",
         "overloaded",
         "timeout",
         "timed out",
+        # An idle stream that never delivered its final message: the wording
+        # ``chat_stream`` uses for its own stall guard, which is as retryable
+        # as the timeouts above and was being classified as permanent.
+        "stalled",
         "connection",
         "server error",
         "temporarily unavailable",
     )
-    _IMAGE_BLOCK_TYPES = frozenset({"image_url", "image"})
+    _RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+    _HTTP_STATUS_PATTERNS = (
+        re.compile(r"\bHTTP(?:/\d+(?:\.\d+)?)?\s+(?P<code>[1-5]\d{2})\b", re.IGNORECASE),
+        re.compile(
+            r"\b(?:error\s+code|http_status|status(?:\s+code)?|status_code)\s*[:=]\s*['\"]?"
+            r"(?P<code>[1-5]\d{2})\b|"
+            r"['\"](?:code|status|status_code|http_status)['\"]\s*:\s*['\"]?"
+            r"(?P<json_code>[1-5]\d{2})\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^\s*(?:Error(?: calling LLM)?[: ]\s*)?(?P<code>[1-5]\d{2})\s+"
+            r"(?:Bad Request|Unauthorized|Forbidden|Not Found|Too Many Requests|"
+            r"Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout)\b",
+            re.IGNORECASE,
+        ),
+    )
     _SENTINEL = object()
 
     @staticmethod
@@ -118,6 +136,23 @@ class LLMProvider(ABC):
         self.api_key = api_key
         self.api_base = api_base
         self.generation: GenerationSettings = GenerationSettings()
+
+    async def aclose(self) -> None:
+        """Release an SDK/HTTP client owned by this provider.
+
+        Provider implementations intentionally expose a common lifecycle even
+        though the underlying SDKs use either ``close`` or ``aclose``.  Most
+        providers own no client and therefore make this a cheap no-op.
+        """
+        client = getattr(self, "_client", None)
+        if client is None:
+            return
+        close = getattr(client, "aclose", None) or getattr(client, "close", None)
+        if not callable(close):
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            await result
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -191,54 +226,6 @@ class LLMProvider(ABC):
         return sanitized
 
     @staticmethod
-    def _image_placeholder(block: dict[str, Any]) -> str:
-        meta = block.get("_meta") or {}
-        label = ""
-        if isinstance(meta, dict):
-            label = str(meta.get("path") or meta.get("filename") or "").strip()
-        if not label and block.get("type") == "image_url":
-            image_url = block.get("image_url") or {}
-            if isinstance(image_url, dict):
-                url = str(image_url.get("url") or "").strip()
-                if url and not url.startswith("data:"):
-                    label = url
-        return f"[image: {label}]" if label else "[image omitted]"
-
-    @classmethod
-    def _strip_image_content(cls, messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
-        """Replace image blocks with text placeholders."""
-        found = False
-        stripped: list[dict[str, Any]] = []
-        for msg in messages:
-            content = msg.get("content")
-            if not isinstance(content, list):
-                stripped.append(dict(msg))
-                continue
-            new_content: list[dict[str, Any]] = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") in cls._IMAGE_BLOCK_TYPES:
-                    new_content.append({"type": "text", "text": cls._image_placeholder(block)})
-                    found = True
-                else:
-                    new_content.append(block)
-            stripped.append({**msg, "content": new_content})
-        return stripped if found else None
-
-    @classmethod
-    def _strip_image_content_inplace(cls, messages: list[dict[str, Any]]) -> bool:
-        """Replace image blocks with text placeholders in-place."""
-        found = False
-        for msg in messages:
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            for idx, block in enumerate(content):
-                if isinstance(block, dict) and block.get("type") in cls._IMAGE_BLOCK_TYPES:
-                    content[idx] = {"type": "text", "text": cls._image_placeholder(block)}
-                    found = True
-        return found
-
-    @staticmethod
     def _normalize_retry_delays(retry_delays: Sequence[float] | None) -> tuple[float, ...]:
         if retry_delays is None:
             return tuple(float(delay) for delay in LLMProvider._CHAT_RETRY_DELAYS)
@@ -297,8 +284,51 @@ class LLMProvider(ABC):
         return response
 
     @classmethod
-    def _is_transient_error(cls, content: str | None) -> bool:
+    def _status_code_from_exception(cls, exc: Exception) -> int | None:
+        """Return an HTTP status carried by the exception or its response."""
+        response = getattr(exc, "response", None)
+        for value in (getattr(exc, "status_code", None), getattr(response, "status_code", None)):
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                status_code = value
+            elif isinstance(value, str) and value.strip().isdigit():
+                status_code = int(value.strip())
+            else:
+                continue
+            if 100 <= status_code <= 599:
+                return status_code
+        return None
+
+    @classmethod
+    def _status_code_from_message(cls, content: str) -> int | None:
+        """Parse only explicit HTTP status fields and conventional status lines."""
+        matches: list[tuple[int, int]] = []
+        for pattern in cls._HTTP_STATUS_PATTERNS:
+            match = pattern.search(content)
+            if match is None:
+                continue
+            raw_code = match.groupdict().get("code") or match.groupdict().get("json_code")
+            if raw_code is not None:
+                matches.append((match.start(), int(raw_code)))
+        return min(matches)[1] if matches else None
+
+    @classmethod
+    def _is_transient_error(
+        cls,
+        content: str | None,
+        *,
+        status_code: int | None = None,
+        exception: Exception | None = None,
+    ) -> bool:
+        if status_code is not None:
+            return status_code in cls._RETRYABLE_HTTP_STATUS_CODES
         err = (content or "").lower()
+        message_status = cls._status_code_from_message(err)
+        if message_status is not None:
+            return message_status in cls._RETRYABLE_HTTP_STATUS_CODES
+        if isinstance(exception, (TimeoutError, ConnectionError)):
+            return True
         return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
 
     async def _call_with_retry(
@@ -313,15 +343,35 @@ class LLMProvider(ABC):
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
         retry_delays: Sequence[float] | None,
+        allow_image_fallback: bool = True,
         **kwargs: Any,
     ) -> LLMResponse:
+        from deeptutor.services.llm.metrics import measure_provider_call
+        from deeptutor.services.llm.multimodal import (
+            has_image_parts,
+            strip_image_parts,
+            strip_image_parts_inplace,
+        )
+
+        raw_call = call
+
+        async def measured_call(**call_kwargs: Any) -> LLMResponse:
+            call_kwargs["model"] = call_kwargs.get("model") or self.get_default_model()
+            return await measure_provider_call(
+                raw_call,
+                provider=getattr(self, "provider_name", self.__class__.__name__),
+                **call_kwargs,
+            )
+
         delays = self._normalize_retry_delays(retry_delays)
         attempt = 0
 
         while True:
             attempt += 1
+            status_code = None
+            caught_exception = None
             try:
-                response = await call(
+                response = await measured_call(
                     messages=messages,
                     tools=tools,
                     model=model,
@@ -334,6 +384,8 @@ class LLMProvider(ABC):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                status_code = self._status_code_from_exception(exc)
+                caught_exception = exc
                 response = LLMResponse(
                     content=f"Error calling LLM: {exc}",
                     finish_reason="error",
@@ -342,14 +394,22 @@ class LLMProvider(ABC):
             if response.finish_reason != "error":
                 return response
 
-            if not self._is_transient_error(response.content):
-                stripped = self._strip_image_content(messages)
-                if stripped is not None:
+            if not self._is_transient_error(
+                response.content,
+                status_code=status_code,
+                exception=caught_exception,
+            ):
+                # Stage-2 vision fallback: only degrade to text-only when the
+                # caller opted in (model is *not* in the known-vision
+                # allowlist). For allowlisted models we trust the images and
+                # let the real error surface rather than masking it.
+                if allow_image_fallback and has_image_parts(messages):
                     logger.warning(
-                        "Non-transient LLM error with image content, retrying once without images"
+                        "Non-transient LLM error with image content; model is not"
+                        " known vision-capable, retrying once without images"
                     )
-                    retry_response = await call(
-                        messages=stripped,
+                    retry_response = await measured_call(
+                        messages=strip_image_parts(messages),
                         tools=tools,
                         model=model,
                         max_tokens=max_tokens,
@@ -359,7 +419,7 @@ class LLMProvider(ABC):
                         **kwargs,
                     )
                     if retry_response.finish_reason != "error":
-                        self._strip_image_content_inplace(messages)
+                        strip_image_parts_inplace(messages)
                     return retry_response
                 return response
 
@@ -386,9 +446,16 @@ class LLMProvider(ABC):
         reasoning_effort: object = _SENTINEL,
         tool_choice: str | dict[str, Any] | None = None,
         retry_delays: Sequence[float] | None = None,
+        allow_image_fallback: bool = True,
         **kwargs: Any,
     ) -> LLMResponse:
-        """Call chat() with retry on transient provider failures."""
+        """Call chat() with retry on transient provider failures.
+
+        ``allow_image_fallback`` (Stage-2 gate) controls whether a
+        non-transient failure carrying images is retried text-only; the
+        factory sets it from ``supports_vision`` so known-vision models keep
+        their images.
+        """
         if max_tokens is self._SENTINEL:
             max_tokens = self.generation.max_tokens
         if temperature is self._SENTINEL:
@@ -414,6 +481,7 @@ class LLMProvider(ABC):
             reasoning_effort=resolved_reasoning_effort,
             tool_choice=tool_choice,
             retry_delays=retry_delays,
+            allow_image_fallback=allow_image_fallback,
             **kwargs,
         )
 
@@ -429,9 +497,11 @@ class LLMProvider(ABC):
         on_content_delta: Callable[[str], Awaitable[None]] | None = None,
         on_reasoning_delta: Callable[[str], Awaitable[None]] | None = None,
         retry_delays: Sequence[float] | None = None,
+        allow_image_fallback: bool = True,
         **kwargs: Any,
     ) -> LLMResponse:
-        """Call chat_stream() with the same transient retry policy as chat()."""
+        """Call chat_stream() with the same transient + Stage-2 image retry
+        policy as :meth:`chat_with_retry`."""
         if max_tokens is self._SENTINEL:
             max_tokens = self.generation.max_tokens
         if temperature is self._SENTINEL:
@@ -457,6 +527,7 @@ class LLMProvider(ABC):
             reasoning_effort=resolved_reasoning_effort,
             tool_choice=tool_choice,
             retry_delays=retry_delays,
+            allow_image_fallback=allow_image_fallback,
             on_content_delta=on_content_delta,
             on_reasoning_delta=on_reasoning_delta,
             **kwargs,

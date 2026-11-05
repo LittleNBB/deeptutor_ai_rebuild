@@ -13,15 +13,11 @@ from typing import Any
 
 import yaml
 
+from deeptutor.runtime.home import get_runtime_home
 from deeptutor.services.path_service import get_path_service
 
-# PROJECT_ROOT points to the actual project root directory (DeepTutor/)
-# Path(__file__) = deeptutor/services/config/loader.py
-# .parent = deeptutor/services/config/
-# .parent.parent = deeptutor/services/
-# .parent.parent.parent = deeptutor/
-# .parent.parent.parent.parent = DeepTutor/ (project root)
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+# Runtime workspace root. Application settings live under PROJECT_ROOT/data/user/settings.
+PROJECT_ROOT = get_runtime_home()
 
 
 def get_runtime_settings_dir(project_root: Path | None = None) -> Path:
@@ -65,9 +61,9 @@ def _inject_runtime_paths(config: dict[str, Any]) -> dict[str, Any]:
     path_service = get_path_service()
     normalized = dict(config or {})
     tools = dict(normalized.get("tools", {}) or {})
-    run_code = dict(tools.get("run_code", {}) or {})
-    run_code["workspace"] = str(path_service.get_chat_feature_dir("_detached_code_execution"))
-    tools["run_code"] = run_code
+    exec_config = dict(tools.get("exec", {}) or {})
+    exec_config["workspace"] = str(path_service.get_chat_feature_dir("_detached_exec"))
+    tools["exec"] = exec_config
     normalized["tools"] = tools
     normalized["paths"] = {
         "user_data_dir": str(path_service.get_user_root()),
@@ -168,7 +164,7 @@ def get_path_from_config(config: dict[str, Any], path_key: str, default: str = N
     if "paths" in injected and path_key in injected["paths"]:
         return injected["paths"][path_key]
     if path_key == "workspace":
-        return injected.get("tools", {}).get("run_code", {}).get("workspace", default)
+        return injected.get("tools", {}).get("exec", {}).get("workspace", default)
     return default
 
 
@@ -176,27 +172,31 @@ def parse_language(language: Any) -> str:
     """
     Unified language configuration parser, supports multiple input formats
 
-    Supported language representations:
-    - English: "en", "english", "English"
-    - Chinese: "zh", "chinese", "Chinese"
+    Resolves the spelled-out aliases of the two locales that ship prompt
+    resources ("english"/"en", "chinese"/"cn"/"zh") and otherwise passes the
+    code through normalized, so a request for Japanese stays ``"ja"`` instead
+    of collapsing to Chinese (#712). Callers that load per-language prompt
+    files fall back to English when a code has no files of its own; what makes
+    the model actually answer in that language is the directive built from
+    this code, not the prompt file.
 
     Args:
-        language: Language configuration value (can be "zh"/"en"/"Chinese"/"English" etc.)
+        language: Language configuration value ("zh"/"en"/"Chinese"/"ja"/…)
 
     Returns:
-        Standardized language code: 'zh' or 'en', defaults to 'zh'
+        Normalized language code, defaulting to 'zh' when nothing is configured
     """
-    if not language:
+    if not isinstance(language, str) or not language.strip():
         return "zh"
 
-    if isinstance(language, str):
-        lang_lower = language.lower()
-        if lang_lower in ["en", "english"]:
-            return "en"
-        if lang_lower in ["zh", "chinese", "cn"]:
-            return "zh"
+    from deeptutor.services.prompt.language import normalize_language
 
-    return "zh"  # Default Chinese
+    code = normalize_language(language)
+    if code in ("en", "english"):
+        return "en"
+    if code in ("zh", "chinese", "cn"):
+        return "zh"
+    return code
 
 
 def get_agent_params(module_name: str) -> dict:
@@ -213,6 +213,7 @@ def get_agent_params(module_name: str) -> dict:
             - "question": Question module agents
             - "brainstorm": Brainstorm tool settings
             - "co_writer": CoWriter module agents
+            - "book": Book module agents (ideation / explore / spine / page plan)
             - "narrator": Narrator agent (independent, for TTS)
             - "llm_probe": Settings → LLM diagnostic probe
 
@@ -226,7 +227,7 @@ def get_agent_params(module_name: str) -> dict:
         >>> params["temperature"]  # 0.3
         >>> params["max_tokens"]   # 8192
     """
-    defaults = {
+    global_defaults = {
         "temperature": 0.5,
         "max_tokens": 4096,
     }
@@ -235,9 +236,17 @@ def get_agent_params(module_name: str) -> dict:
         "research": ("capabilities", "research"),
         "question": ("capabilities", "question"),
         "co_writer": ("capabilities", "co_writer"),
+        "visualize": ("capabilities", "visualize"),
+        # Book was missing here, so ``get_agent_params("book")`` returned the
+        # 4096 global fallback *before* ever opening agents.yaml — a budget no
+        # user could raise, and one a reasoning model spends entirely on hidden
+        # tokens, leaving the spine stage an empty response and the book a
+        # single "Overview" chapter (#1316).
+        "book": ("capabilities", "book"),
         "brainstorm": ("tools", "brainstorm"),
         "vision_solver": ("plugins", "vision_solver"),
         "math_animator": ("plugins", "math_animator"),
+        "video_lesson": ("plugins", "video_lesson"),
         "llm_probe": ("diagnostics", "llm_probe"),
     }
     path = get_runtime_settings_dir(PROJECT_ROOT) / "agents.yaml"
@@ -245,49 +254,134 @@ def get_agent_params(module_name: str) -> dict:
         raise FileNotFoundError(f"Missing required configuration file: {path}")
     section = section_map.get(module_name)
     if section is None:
-        return defaults
+        return global_defaults
+
+    # Per-module defaults come from the shipped DEFAULT_AGENTS_SETTINGS so that
+    # adding a new capability seeded with non-default tokens (e.g. visualize at
+    # 16k) doesn't require existing users to hand-edit their stale agents.yaml.
+    # Imported lazily to avoid a circular dependency with services.setup.
+    from deeptutor.services.setup.init import DEFAULT_AGENTS_SETTINGS
+
+    seeded: dict[str, Any] = DEFAULT_AGENTS_SETTINGS
+    for key in section:
+        seeded = seeded.get(key, {}) if isinstance(seeded, dict) else {}
+    module_defaults = {
+        "temperature": seeded.get("temperature", global_defaults["temperature"])
+        if isinstance(seeded, dict)
+        else global_defaults["temperature"],
+        "max_tokens": seeded.get("max_tokens", global_defaults["max_tokens"])
+        if isinstance(seeded, dict)
+        else global_defaults["max_tokens"],
+    }
+
     with open(path, encoding="utf-8") as f:
         agents_config = yaml.safe_load(f) or {}
     module_config: dict[str, Any] = agents_config
     for key in section:
-        module_config = module_config.get(key, {})
+        module_config = module_config.get(key, {}) if isinstance(module_config, dict) else {}
     return {
-        "temperature": module_config.get("temperature", defaults["temperature"]),
-        "max_tokens": module_config.get("max_tokens", defaults["max_tokens"]),
+        "temperature": module_config.get("temperature", module_defaults["temperature"]),
+        "max_tokens": module_config.get("max_tokens", module_defaults["max_tokens"]),
     }
 
 
 DEFAULT_CHAT_PARAMS: dict[str, Any] = {
     "temperature": 0.2,
+    # Exploring-loop budget: max LLM rounds in one turn's loop (a round
+    # without tool calls ends the loop early — the normal exit).
+    "max_rounds": 8,
+    "exploring": {"max_tokens": 1600},
     "responding": {"max_tokens": 8000},
-    "answer_now": {"max_tokens": 8000},
-    "thinking": {"max_tokens": 2000},
-    "observing": {"max_tokens": 2000},
-    "acting": {"max_tokens": 2000},
-    "react_fallback": {"max_tokens": 1500},
+}
+
+# A capability that makes several different LLM calls cannot be described by
+# one ``max_tokens``: the step that emits a whole JSON plan and the step that
+# writes one paragraph need different room. ``chat`` has said so since it
+# gained ``exploring``/``responding``; ``question`` and ``research`` said the
+# same thing in module-level constants instead, where no user could reach them
+# — which is how #1318 shipped a plan step budgeted below the capability's own
+# 4096, and how ``capabilities.question.max_tokens`` came to govern exactly one
+# of that capability's LLM calls (the follow-up agent) while five others
+# ignored it.
+#
+# The rule these tables enforce: **agents.yaml owns every LLM budget**
+# (temperature, max_tokens, per stage), **main.yaml owns runtime behaviour**
+# (iteration caps, timeouts, retry policy, modes). A budget in main.yaml is a
+# bug, not a style choice.
+#
+# Values here are the ones these pipelines shipped as constants, so adopting
+# the table changes nothing until somebody edits agents.yaml. Stage names are
+# the pipeline's own vocabulary — they are the key a user types.
+DEFAULT_QUESTION_PARAMS: dict[str, Any] = {
+    "answering": {"max_tokens": 4000},
+    "planning": {"max_tokens": 6000},
+    "quiz_finish": {"max_tokens": 3000},
+    "repair": {"max_tokens": 2500},
+    "tool_summarizer": {"max_tokens": 800},
+}
+
+DEFAULT_RESEARCH_PARAMS: dict[str, Any] = {
+    "note": {"max_tokens": 1500},
+    "block": {"max_tokens": 6000},
+    "outline": {"max_tokens": 2000},
+    "report_outline": {"max_tokens": 2000},
+    "report_intro": {"max_tokens": 3000},
+    "report_section": {"max_tokens": 12000},
+    "report_conclusion": {"max_tokens": 3000},
+}
+
+DEFAULT_EXPLORE_CONTEXT_PARAMS: dict[str, Any] = {
+    "loop": {"max_tokens": 2000},
+    "briefing": {"max_tokens": 1400},
+}
+
+_STAGED_CAPABILITY_DEFAULTS: dict[str, dict[str, Any]] = {
+    "chat": DEFAULT_CHAT_PARAMS,
+    "question": DEFAULT_QUESTION_PARAMS,
+    "research": DEFAULT_RESEARCH_PARAMS,
+    "explore_context": DEFAULT_EXPLORE_CONTEXT_PARAMS,
 }
 
 
-def get_chat_params() -> dict[str, Any]:
-    """
-    Read ``capabilities.chat`` from agents.yaml with deep-merged defaults.
+def get_capability_params(capability: str) -> dict[str, Any]:
+    """Read one capability's per-stage settings from agents.yaml.
 
-    Unlike :func:`get_agent_params`, the chat capability has per-stage
-    sub-sections (``responding``, ``answer_now``, ``thinking``, ``observing``,
-    ``acting``, ``react_fallback``), each with its own ``max_tokens``. A single
-    ``temperature`` is shared across all stages.
+    Unlike :func:`get_agent_params` — which answers "what temperature and
+    ceiling does this module's :class:`BaseAgent` use" — this answers "what
+    does each *step* of this capability's pipeline get". Unknown keys in the
+    user's file are dropped rather than merged, so a legacy or misspelled
+    entry cannot smuggle a value into a stage that does not exist.
 
     Returns:
-        dict: Deep-merged chat configuration. Always contains every stage key
-        from :data:`DEFAULT_CHAT_PARAMS` so callers can index without checks.
+        dict: the shipped defaults deep-merged with the user's overrides.
+        Every stage in the capability's default table is present, so callers
+        index without checks.
+
+    Raises:
+        KeyError: if ``capability`` has no staged defaults. Adding a stage
+            means adding it to the table above, which is the point: there is
+            one list of budgets, and it is this one.
     """
+    defaults = _STAGED_CAPABILITY_DEFAULTS[capability]
     path = get_runtime_settings_dir(PROJECT_ROOT) / "agents.yaml"
     cfg: dict[str, Any] = {}
     if path.exists():
         with open(path, encoding="utf-8") as f:
             agents_config = yaml.safe_load(f) or {}
-        cfg = (agents_config.get("capabilities", {}) or {}).get("chat", {}) or {}
-    return _deep_merge(DEFAULT_CHAT_PARAMS, cfg)
+        cfg = (agents_config.get("capabilities", {}) or {}).get(capability, {}) or {}
+    known_keys = set(defaults)
+    filtered_cfg = {key: value for key, value in cfg.items() if key in known_keys}
+    return _deep_merge(defaults, filtered_cfg)
+
+
+def get_chat_params() -> dict[str, Any]:
+    """Read ``capabilities.chat`` from agents.yaml with deep-merged defaults.
+
+    Kept as its own name because the chat loop reads it on a hot path and
+    every caller already spells it this way; the behaviour is
+    :func:`get_capability_params` with ``"chat"``.
+    """
+    return get_capability_params("chat")
 
 
 __all__ = [

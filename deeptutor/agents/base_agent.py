@@ -12,21 +12,20 @@ This is the single source of truth for agent base functionality across:
 from abc import ABC, abstractmethod
 import inspect
 import logging
-import os
 import time
 from typing import Any, AsyncGenerator, Awaitable, Callable
 
 from deeptutor.config.settings import settings
 from deeptutor.logging import LLMStats
 from deeptutor.services.config import get_agent_params
-from deeptutor.services.llm import complete as llm_complete
-from deeptutor.services.llm import complete_with_response as llm_complete_with_response
 from deeptutor.services.llm import (
+    StreamOutcome,
     get_llm_config,
     get_token_limit_kwargs,
     prepare_multimodal_messages,
     supports_response_format,
 )
+from deeptutor.services.llm import complete as llm_complete
 from deeptutor.services.llm import stream as llm_stream
 from deeptutor.services.prompt import get_prompt_manager
 
@@ -105,13 +104,12 @@ class BaseAgent(ABC):
             self.model = model or env_llm.model
             self.api_version = api_version or getattr(env_llm, "api_version", None)
             self.binding = binding or getattr(env_llm, "binding", "openai")
-        except ValueError:
-            # Fallback if env config not available
-            self.api_key = api_key or os.getenv("LLM_API_KEY")
-            self.base_url = base_url or os.getenv("LLM_HOST")
-            self.model = model or os.getenv("LLM_MODEL")
-            self.api_version = api_version or os.getenv("LLM_API_VERSION")
-            self.binding = binding or os.getenv("LLM_BINDING", "openai")
+        except Exception:
+            self.api_key = api_key
+            self.base_url = base_url
+            self.model = model
+            self.api_version = api_version
+            self.binding = binding or "openai"
 
         # Get Agent-specific configuration (if config provided)
         self.agent_config = self.config.get("agents", {}).get(agent_name, {})
@@ -175,14 +173,9 @@ class BaseAgent(ABC):
         if self.model:
             return self.model
 
-        # 4. Fallback to environment variable
-        env_model = os.getenv("LLM_MODEL")
-        if env_model:
-            return env_model
-
         raise ValueError(
             f"Model not configured for agent {self.agent_name}. "
-            "Please set LLM_MODEL in .env or activate a provider."
+            "Please activate a model in Settings > Language models."
         )
 
     def get_temperature(self) -> float:
@@ -315,7 +308,7 @@ class BaseAgent(ABC):
         Track token usage using available tracker.
 
         Supports:
-        1. External TokenTracker (if self.token_tracker is set) — with API usage data
+        1. External TokenTracker (if self.token_tracker is set)
         2. Shared LLMStats (always available)
 
         Args:
@@ -324,22 +317,29 @@ class BaseAgent(ABC):
             user_prompt: User prompt
             response: LLM response
             stage: Stage name (optional)
-            usage: Raw token usage dict from API (includes cache fields)
+            usage: Raw provider usage dict (includes cache-hit fields when available)
         """
         stage_label = stage or self.agent_name
 
         # 1. Use external TokenTracker if provided
         if self.token_tracker:
+            tracker_kwargs: dict[str, object] = {
+                "agent_name": self.agent_name,
+                "stage": stage_label,
+                "model": model,
+                "system_prompt": system_prompt,
+                "user_prompt": user_prompt,
+                "response_text": response,
+            }
+            if usage:
+                tracker_kwargs["usage"] = usage
             try:
-                self.token_tracker.add_usage(
-                    agent_name=self.agent_name,
-                    stage=stage_label,
-                    model=model,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    response_text=response,
-                    usage=usage,
-                )
+                try:
+                    self.token_tracker.add_usage(**tracker_kwargs)
+                except TypeError:
+                    # Trackers that predate the ``usage`` kwarg.
+                    tracker_kwargs.pop("usage", None)
+                    self.token_tracker.add_usage(**tracker_kwargs)
             except Exception:
                 pass  # Don't let tracking errors affect main flow
 
@@ -369,6 +369,7 @@ class BaseAgent(ABC):
         stage: str | None = None,
         attachments: list[Any] | None = None,
         trace_meta: dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         """
         Unified interface for calling LLM (non-streaming).
@@ -387,6 +388,9 @@ class BaseAgent(ABC):
             verbose: Whether to print raw LLM output (default True)
             stage: Stage marker for logging and tracking
             attachments: Image/file attachments for multimodal input (optional)
+            reasoning_effort: Override the model's thinking level for this one
+                call. Callers use it to free the token budget for the answer
+                when a reasoning model spent it all on hidden tokens.
 
         Returns:
             LLM response text
@@ -407,6 +411,9 @@ class BaseAgent(ABC):
         # Handle token limit for newer OpenAI models
         if max_tokens:
             kwargs.update(get_token_limit_kwargs(model, max_tokens))
+
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
 
         # Handle response_format with capability check
         if response_format:
@@ -433,12 +440,6 @@ class BaseAgent(ABC):
                 messages, attachments, binding=self.binding, model=model
             )
             messages = mm_result.messages
-            if mm_result.images_stripped:
-                self.logger.info(
-                    "Images stripped for %s/%s – model does not support vision",
-                    self.binding,
-                    model,
-                )
         if messages:
             kwargs["messages"] = messages
 
@@ -467,9 +468,8 @@ class BaseAgent(ABC):
 
         # Call LLM via factory (routes to cloud or local provider)
         response = None
-        usage = None
         try:
-            response, usage = await llm_complete_with_response(
+            response = await llm_complete(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 model=model,
@@ -494,14 +494,13 @@ class BaseAgent(ABC):
         # Calculate duration
         call_duration = time.time() - start_time
 
-        # Track token usage (with API usage data for accurate billing)
+        # Track token usage
         self._track_tokens(
             model=model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             response=response,
             stage=stage_label,
-            usage=usage,
         )
 
         # Log output
@@ -539,6 +538,9 @@ class BaseAgent(ABC):
         stage: str | None = None,
         attachments: list[Any] | None = None,
         trace_meta: dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        outcome: StreamOutcome | None = None,
     ) -> AsyncGenerator[str, None]:
         """
         Unified interface for streaming LLM responses.
@@ -556,6 +558,12 @@ class BaseAgent(ABC):
             response_format: JSON schema for structured output (optional)
             stage: Stage marker for logging
             attachments: Image/file attachments for multimodal input (optional)
+            reasoning_effort: Override the model's thinking level for this one
+                call (see :meth:`call_llm`).
+            outcome: Filled in with the provider's terminal reason and usage
+                when the stream ends. An agent that parses the streamed text
+                needs it to tell a complete response from one the provider cut
+                off at ``max_tokens`` (#1545).
 
         Yields:
             Response chunks as strings
@@ -569,10 +577,15 @@ class BaseAgent(ABC):
         kwargs = {
             "temperature": temperature,
         }
+        if tools:
+            kwargs["tools"] = tools
 
         # Handle token limit for newer OpenAI models
         if max_tokens:
             kwargs.update(get_token_limit_kwargs(model, max_tokens))
+
+        if reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
 
         # Handle response_format with capability check
         if response_format:
@@ -598,12 +611,6 @@ class BaseAgent(ABC):
                 messages, attachments, binding=self.binding, model=model
             )
             messages = mm_result.messages
-            if mm_result.images_stripped:
-                self.logger.info(
-                    "Images stripped for %s/%s – model does not support vision",
-                    self.binding,
-                    model,
-                )
 
         # Log input
         stage_label = stage or self.agent_name
@@ -631,11 +638,6 @@ class BaseAgent(ABC):
         # Track start time
         start_time = time.time()
         full_response = ""
-        stream_usage: dict[str, int] | None = None
-
-        def _on_stream_usage(usage: dict[str, int]) -> None:
-            nonlocal stream_usage
-            stream_usage = usage
 
         try:
             # Stream via factory (routes to cloud or local provider)
@@ -649,7 +651,7 @@ class BaseAgent(ABC):
                 binding=self.binding,
                 messages=messages,
                 max_retries=max_retries,
-                on_usage=_on_stream_usage,
+                outcome=outcome,
                 **kwargs,
             ):
                 full_response += chunk
@@ -662,14 +664,14 @@ class BaseAgent(ABC):
                 )
                 yield chunk
 
-            # Track token usage after streaming completes (with API usage data)
+            # Track token usage after streaming completes
             self._track_tokens(
                 model=model,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 response=full_response,
                 stage=stage_label,
-                usage=stream_usage,
+                usage=dict(outcome.usage) if outcome is not None and outcome.usage else None,
             )
 
             # Log output

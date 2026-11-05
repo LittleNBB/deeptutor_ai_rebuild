@@ -1,43 +1,21 @@
 "use client";
 
 import dynamic from "next/dynamic";
+import { hasMarkdownMath } from "@/lib/latex";
 import SimpleMarkdownRenderer from "./SimpleMarkdownRenderer";
+import type { MarkdownRendererProps } from "./markdown-renderer-types";
+
+export type { MarkdownRendererProps } from "./markdown-renderer-types";
 
 const RichMarkdownRenderer = dynamic(() => import("./RichMarkdownRenderer"), {
   ssr: false,
 });
 
-export interface MarkdownRendererProps {
-  content: string;
-  className?: string;
-  variant?: "default" | "compact" | "prose" | "trace";
-  enableMath?: boolean;
-  enableCode?: boolean;
-  enableMermaid?: boolean;
-  allowHtml?: boolean;
-  /**
-   * When true, top-level block elements receive a `data-source-line` attribute
-   * pointing at their starting line in the original markdown source. Useful for
-   * editor/preview scroll synchronization.
-   */
-  trackSourceLines?: boolean;
-}
-
-function detectMathContent(content: string): boolean {
-  if (/(^|[^\\])\$\$[\s\S]+?\$\$/.test(content)) return true;
-  if (/\\\(|\\\[/.test(content)) return true;
-  // Single-dollar inline math containing LaTeX commands (\cmd) or math operators ({}_^)
-  if (
-    /(?:^|[^$\\])\$(?!\$|\s)(?:[^$\n]*(?:\\[a-zA-Z]+|[{}_^]))[^$\n]*\$(?!\$)/m.test(
-      content,
-    )
-  )
-    return true;
-  return false;
-}
-
 function detectCodeContent(content: string): boolean {
-  return /```[A-Za-z0-9_+#.-]+/.test(content);
+  // Match any opening triple-backtick, even before the language identifier
+  // arrives. Otherwise streaming flips Simple→Rich the moment the language
+  // tag lands a few tokens after the fence.
+  return /```/.test(content);
 }
 
 function detectMermaidContent(content: string): boolean {
@@ -53,30 +31,43 @@ function detectHtmlContent(content: string): boolean {
 
 export default function MarkdownRenderer({
   content,
+  learningTextSize,
   className = "",
   variant = "default",
   enableMath,
   enableCode,
   enableMermaid,
+  enableImages,
   allowHtml,
   trackSourceLines,
 }: MarkdownRendererProps) {
-  const resolvedEnableMath = enableMath ?? detectMathContent(content);
+  const resolvedEnableMath = enableMath ?? hasMarkdownMath(content);
   const resolvedEnableCode = enableCode ?? detectCodeContent(content);
   const resolvedEnableMermaid = enableMermaid ?? detectMermaidContent(content);
   const resolvedAllowHtml = allowHtml ?? detectHtmlContent(content);
+  // Detection above is intentionally monotonic — once any of the rich
+  // triggers fire, more tokens never un-fire them. Combined with the
+  // append-only nature of streaming content this gives us a stable
+  // Simple→Rich one-way transition (the Rich subtree mounts once and
+  // stays). No additional lock state is needed.
+  //
+  // `trace` is not excluded. It used to be, which pinned every trace bubble to
+  // the Simple renderer and left `RichMarkdownRenderer`'s whole `trace` branch
+  // unreachable — so a tutoring round that reasoned in formulas printed raw
+  // `$y'' + 2y' + 5y = 0$` at the reader. The trigger is the content, not the
+  // surface: a trace bubble with no math still takes the cheap path.
   const shouldUseRich =
-    variant !== "trace" &&
-    (trackSourceLines ||
-      resolvedEnableMath ||
-      resolvedEnableCode ||
-      resolvedEnableMermaid ||
-      resolvedAllowHtml);
+    trackSourceLines ||
+    resolvedEnableMath ||
+    resolvedEnableCode ||
+    resolvedEnableMermaid ||
+    resolvedAllowHtml;
 
   if (!shouldUseRich) {
     return (
       <SimpleMarkdownRenderer
         content={content}
+        learningTextSize={learningTextSize}
         className={className}
         variant={variant}
       />
@@ -86,11 +77,13 @@ export default function MarkdownRenderer({
   return (
     <RichMarkdownRenderer
       content={content}
+      learningTextSize={learningTextSize}
       className={className}
       variant={variant}
       enableMath={resolvedEnableMath}
       enableCode={resolvedEnableCode}
       enableMermaid={resolvedEnableMermaid}
+      enableImages={enableImages}
       allowHtml={resolvedAllowHtml}
       trackSourceLines={trackSourceLines}
     />

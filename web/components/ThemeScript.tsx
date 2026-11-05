@@ -1,3 +1,9 @@
+import {
+  DEFAULT_UI_LAYOUT,
+  UI_LAYOUT_ATTRIBUTE,
+  UI_LAYOUT_STORAGE_KEY,
+} from "@/lib/ui-layout";
+
 /**
  * ThemeScript - Initializes theme from localStorage before React hydration
  * This prevents the flash of wrong theme on page load.
@@ -24,15 +30,26 @@ export default function ThemeScript() {
         } else if (stored === 'light') {
           // already clean
         } else {
+          // Missing, "system", or unrecognized: paint the OS palette for this
+          // load only. Do not freeze it into localStorage.
           if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
             document.documentElement.classList.add('dark');
-            localStorage.setItem('deeptutor-theme', 'dark');
           } else {
-            localStorage.setItem('deeptutor-theme', 'light');
+            document.documentElement.classList.add('theme-snow');
           }
         }
       } catch (e) {
         /* localStorage may be disabled */
+      }
+      // UI layout tokens (see lib/ui-layout.ts) must also paint before React.
+      try {
+        const layout = localStorage.getItem('${UI_LAYOUT_STORAGE_KEY}');
+        document.documentElement.setAttribute(
+          '${UI_LAYOUT_ATTRIBUTE}',
+          layout === 'classic' || layout === 'modern' ? layout : '${DEFAULT_UI_LAYOUT}',
+        );
+      } catch (e) {
+        document.documentElement.setAttribute('${UI_LAYOUT_ATTRIBUTE}', '${DEFAULT_UI_LAYOUT}');
       }
     })();
   `;

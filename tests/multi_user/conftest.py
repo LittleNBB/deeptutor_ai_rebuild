@@ -24,21 +24,28 @@ def mu_isolated_root(tmp_path, monkeypatch) -> Path:
     Also clears the ``_path_services`` cache so ``get_path_service()`` can be
     re-resolved per test without leaking instances created in earlier tests.
     """
-    from deeptutor.multi_user import grants, identity, paths
+    from deeptutor.multi_user import (
+        audit,
+        device_credentials,
+        grants,
+        guardians,
+        identity,
+        paths,
+    )
 
     project_root = tmp_path
-    multi_user_root = tmp_path / "multi-user"
-    system_root = multi_user_root / "_system"
     admin_root = (project_root / "data").resolve()
+    users_root = admin_root / "users"
+    system_root = admin_root / "system"
 
     monkeypatch.setattr(paths, "PROJECT_ROOT", project_root)
-    monkeypatch.setattr(paths, "MULTI_USER_ROOT", multi_user_root)
+    monkeypatch.setattr(paths, "USERS_ROOT", users_root)
     monkeypatch.setattr(paths, "SYSTEM_ROOT", system_root)
     monkeypatch.setattr(paths, "ADMIN_WORKSPACE_ROOT", admin_root)
+    monkeypatch.setattr(paths, "LEGACY_MULTI_USER_ROOT", project_root / "multi-user")
     monkeypatch.setattr(paths, "_path_services", {})
 
     monkeypatch.setattr(identity, "PROJECT_ROOT", project_root)
-    monkeypatch.setattr(identity, "MULTI_USER_ROOT", multi_user_root)
     monkeypatch.setattr(identity, "SYSTEM_ROOT", system_root)
     monkeypatch.setattr(identity, "AUTH_DIR", system_root / "auth")
     monkeypatch.setattr(identity, "USERS_FILE", system_root / "auth" / "users.json")
@@ -55,6 +62,22 @@ def mu_isolated_root(tmp_path, monkeypatch) -> Path:
     )
 
     monkeypatch.setattr(grants, "GRANTS_DIR", system_root / "grants")
+    monkeypatch.setattr(guardians, "GUARDIANS_FILE", system_root / "guardians.json")
+    monkeypatch.setattr(audit, "SYSTEM_ROOT", system_root)
+    monkeypatch.setattr(
+        device_credentials,
+        "DEVICE_CREDENTIALS_FILE",
+        system_root / "auth" / "device_credentials.json",
+    )
+
+    # The ``auth.json`` bootstrap admin is process-global state rather than a
+    # path, and it now takes part in the first-user promotion decision (#849).
+    # Clear it so a developer with real credentials configured sees the same
+    # results as CI; tests that need one patch these back explicitly.
+    from deeptutor.services import auth as auth_service
+
+    monkeypatch.setattr(auth_service, "AUTH_USERNAME", "")
+    monkeypatch.setattr(auth_service, "AUTH_PASSWORD_HASH", "")
 
     admin_root.mkdir(parents=True, exist_ok=True)
     return tmp_path
@@ -73,7 +96,7 @@ def make_user(mu_isolated_root):
             scope = UserScope(
                 kind="user",
                 user_id=uid,
-                root=(mu_isolated_root / "multi-user" / uid).resolve(),
+                root=(mu_isolated_root / "data" / "users" / uid).resolve(),
             )
         return CurrentUser(
             id=uid,

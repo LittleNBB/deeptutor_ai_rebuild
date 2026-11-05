@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -48,6 +50,17 @@ def _normalize_language(language: str) -> str:
     return normalized
 
 
+@lru_cache(maxsize=256)
+def _read_hint_data(path: Path, mtime_ns: int, size: int) -> dict[str, Any]:
+    """Bounded cache of static assets, invalidated by each file's revision.
+
+    Never expose this dictionary to callers: each load constructs fresh hint
+    objects, so one tool's mutations cannot change another turn's prompt.
+    """
+    with path.open(encoding="utf-8") as file:
+        return yaml.safe_load(file) or {}
+
+
 def load_prompt_hints(tool_name: str, language: str = "en") -> ToolPromptHints:
     """Load per-tool prompt hints from YAML with zh/en fallback."""
     normalized_language = _normalize_language(language)
@@ -59,8 +72,8 @@ def load_prompt_hints(tool_name: str, language: str = "en") -> ToolPromptHints:
     for path in candidates:
         if not path.is_file():
             continue
-        with open(path, encoding="utf-8") as file:
-            data = yaml.safe_load(file) or {}
+        revision = path.stat()
+        data = _read_hint_data(path, revision.st_mtime_ns, revision.st_size)
         aliases = [
             ToolAlias(
                 name=str(item.get("name", "")).strip(),
@@ -91,13 +104,34 @@ class ToolPromptComposer:
     def __init__(self, language: str = "en") -> None:
         self.language = _normalize_language(language)
 
-    def format_list(self, hints: list[ToolHintEntry], kb_name: str = "") -> str:
+    def format_list(self, hints: list[ToolHintEntry]) -> str:
         lines: list[str] = []
         for name, hint in hints:
-            description = self._apply_kb_name(hint.short_description, kb_name)
-            if description:
-                lines.append(f"- {name}: {description}")
+            if hint.short_description:
+                lines.append(f"- {name}: {hint.short_description}")
         return "\n".join(lines)
+
+    def format_list_with_usage(self, hints: list[ToolHintEntry]) -> str:
+        """Per-tool bullet that includes ``when_to_use`` and ``input_format``.
+
+        Used by the chat persona prompt so the LLM has enough per-tool
+        guidance to decide *whether* to call it, not just *what it is*.
+        Tools without a ``short_description`` are skipped entirely so the
+        block never carries empty bullets.
+        """
+        when_label = "When to use" if self.language != "zh" else "适用场景"
+        input_label = "Input" if self.language != "zh" else "参数格式"
+        blocks: list[str] = []
+        for name, hint in hints:
+            if not hint.short_description:
+                continue
+            entry: list[str] = [f"- `{name}` — {hint.short_description}"]
+            if hint.when_to_use:
+                entry.append(f"    {when_label}: {hint.when_to_use}")
+            if hint.input_format:
+                entry.append(f"    {input_label}: {hint.input_format}")
+            blocks.append("\n".join(entry))
+        return "\n".join(blocks)
 
     def format_table(
         self,
@@ -177,12 +211,32 @@ class ToolPromptComposer:
             sections.append(f"**{label}**\n" + "\n".join(items))
         return "\n\n".join(sections)
 
-    @staticmethod
-    def _apply_kb_name(text: str, kb_name: str) -> str:
-        if not kb_name or not text:
-            return text
-        updated = text.replace("the uploaded knowledge base", f'the knowledge base "{kb_name}"')
-        return updated.replace("已上传知识库", f'知识库 "{kb_name}"')
+
+def compose_prompt_text(
+    hints: list[ToolHintEntry],
+    *,
+    format: str = "list",
+    language: str = "en",
+    **opts: Any,
+) -> str:
+    """Render *hints* in the named format.
+
+    Lives here rather than on a registry so every registry — the process-wide
+    one and any scoped view over it — renders a tool list identically instead
+    of each owning a copy of the format dispatch.
+    """
+    composer = ToolPromptComposer(language=language)
+    if format == "list":
+        return composer.format_list(hints)
+    if format == "list_with_usage":
+        return composer.format_list_with_usage(hints)
+    if format == "table":
+        return composer.format_table(hints, control_actions=opts.get("control_actions"))
+    if format == "aliases":
+        return composer.format_aliases(hints)
+    if format == "phased":
+        return composer.format_phased(hints)
+    raise ValueError(f"Unsupported prompt format: {format}")
 
 
-__all__ = ["ToolPromptComposer", "load_prompt_hints"]
+__all__ = ["ToolPromptComposer", "compose_prompt_text", "load_prompt_hints"]

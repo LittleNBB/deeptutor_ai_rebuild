@@ -2,18 +2,44 @@
 
 from __future__ import annotations
 
-from typing import Literal
+import logging
+from typing import Any, Literal, get_args
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+logger = logging.getLogger(__name__)
+
+RenderType = Literal[
+    "svg",
+    "chartjs",
+    "mermaid",
+    "mindmap",
+    "html",
+    "manim_video",
+    "manim_image",
+]
+
+VisualGenre = Literal[
+    "",
+    "flowchart",
+    "structural",
+    "illustrative",
+    "chart",
+    "stepper",
+    "interactive",
+    "mockup",
+    "art",
+]
 
 
 class VisualizationAnalysis(BaseModel):
     """Output of the analysis stage."""
 
-    render_type: Literal["svg", "chartjs", "mermaid", "html"] = Field(
+    render_type: RenderType = Field(
         description=(
-            "Whether to render as raw SVG, a Chart.js configuration, a Mermaid "
-            "diagram, or a self-contained interactive HTML page."
+            "Render output: raw SVG, a Chart.js configuration, a Mermaid "
+            "diagram, a self-contained interactive HTML page, or a Manim "
+            "animation (video) / storyboard image."
         ),
     )
     description: str = Field(
@@ -41,6 +67,41 @@ class VisualizationAnalysis(BaseModel):
         default="",
         description="Why this render_type was chosen over the alternative.",
     )
+    visual_genre: VisualGenre = Field(
+        default="",
+        description=(
+            "Teaching-oriented sub-type that drives the code-generation style, "
+            "routed on the user's intent (the verb), not the topic (the noun): "
+            "'flowchart'/'structural' for reference maps, 'illustrative' for "
+            "intuition/'how does X work' spatial metaphors, 'stepper' for "
+            "cyclic or staged walkthroughs, 'chart' for quantitative data, "
+            "'interactive'/'mockup'/'art' for the matching HTML/SVG experiences. "
+            "Empty when no sub-type applies."
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_off_enum_values(cls, data: Any) -> Any:
+        """Degrade an invented enum value instead of failing the whole render.
+
+        Models regularly answer with a genre or render type that is not in the
+        prompt's list ("simulation", "diagram"). Both fields are enums, so
+        validation used to abort generation over a label that no downstream
+        stage strictly needs — the genre only selects a code-generation style,
+        and svg is the universal fallback render.
+        """
+        if not isinstance(data, dict):
+            return data
+        genre = data.get("visual_genre")
+        if genre is not None and genre not in get_args(VisualGenre):
+            logger.warning("Discarding unknown visual_genre %r", genre)
+            data = {**data, "visual_genre": ""}
+        render_type = data.get("render_type")
+        if render_type is not None and render_type not in get_args(RenderType):
+            logger.warning("Falling back to svg for unknown render_type %r", render_type)
+            data = {**data, "render_type": "svg"}
+        return data
 
 
 class ReviewResult(BaseModel):

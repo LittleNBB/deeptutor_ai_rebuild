@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from deeptutor.knowledge.add_documents import DocumentAdder
 from deeptutor.knowledge.initializer import KnowledgeBaseInitializer
 
@@ -24,6 +26,7 @@ def test_document_adder_does_not_create_compatibility_dirs(tmp_path: Path) -> No
     (kb_dir / "raw").mkdir(parents=True, exist_ok=True)
     (kb_dir / "version-1").mkdir(parents=True, exist_ok=True)
     (kb_dir / "version-1" / "docstore.json").write_text("{}", encoding="utf-8")
+    (kb_dir / "version-1" / "index_store.json").write_text("{}", encoding="utf-8")
     (kb_dir / "version-1" / "meta.json").write_text(
         '{"signature": "sig", "version": "version-1"}',
         encoding="utf-8",
@@ -37,3 +40,17 @@ def test_document_adder_does_not_create_compatibility_dirs(tmp_path: Path) -> No
     assert not (kb_dir / "index_versions").exists()
     assert not (kb_dir / "images").exists()
     assert not (kb_dir / "content_list").exists()
+
+
+def test_initializer_unwritable_base_dir_fail_fasts(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "deeptutor.knowledge.initializer.ensure_data_volume_writable",
+        lambda _path: (_ for _ in ()).throw(
+            PermissionError(
+                "Data directory is not writable by the running process (euid=1000, egid=1000)"
+            )
+        ),
+    )
+    initializer = KnowledgeBaseInitializer(kb_name="demo", base_dir=str(tmp_path))
+    with pytest.raises(PermissionError, match="not writable"):
+        initializer.create_directory_structure()

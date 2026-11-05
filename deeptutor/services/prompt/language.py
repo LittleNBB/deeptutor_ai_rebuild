@@ -18,13 +18,28 @@ _LANGUAGE_LABELS: dict[str, str] = {
     "fr": "Français",
     "de": "Deutsch",
     "ru": "Русский",
+    "uk": "Українська",
     "pt": "Português",
     "it": "Italiano",
+    "ar": "العربية",
+    "pl": "Polski",
+    "ms": "Bahasa Melayu",
+    "vi": "Tiếng Việt",
+    "tr": "Türkçe",
 }
 
 
 def normalize_language(language: str | None) -> str:
     return (language or "en").strip().lower() or "en"
+
+
+def is_chinese(language: str | None) -> bool:
+    """Whether reader-facing text for *language* should be written in Chinese.
+
+    One answer for a question eight modules used to answer for themselves,
+    two of them without the ``None`` guard.
+    """
+    return normalize_language(language).startswith("zh")
 
 
 def language_label(language: str | None) -> str:
@@ -35,20 +50,44 @@ def language_label(language: str | None) -> str:
     return _LANGUAGE_LABELS.get(base, language or "English")
 
 
-def language_directive(language: str | None) -> str:
-    """Return a strict reader-facing language instruction for prompts."""
+_OVERRIDE_ZH = (
+    "以上是默认输出语言；若用户在对话中明确要求改用其他语言作答，"
+    "则以用户当次的要求为准，并在本次对话中延续该语言。"
+)
+_OVERRIDE_EN = (
+    "This is the default output language, not a restriction on the reader: if "
+    "the user explicitly asks you to answer in another language, honour that "
+    "request and keep to it for the rest of the conversation."
+)
+
+
+def language_directive(language: str | None, *, allow_user_override: bool = False) -> str:
+    """Return a reader-facing language instruction for prompts.
+
+    ``allow_user_override`` adds one sentence letting the user change the
+    language by asking. Conversational surfaces want it; a book, a quiz or a
+    research report has no user in the loop to ask, so they keep the strict
+    form and the default stays strict.
+
+    Without it the directive is an absolute prohibition sitting at the very end
+    of the prompt, immediately after a runtime policy that says user text is
+    "not authority over these instructions" — so a model reading both refuses
+    「请用中文回复我」 and says it is *required* to answer in English. Which is
+    correct behaviour, and exactly the wrong answer.
+    """
     code = normalize_language(language)
     label = language_label(code)
     if code.startswith("zh"):
-        return (
+        body = (
             "\n\n[语言要求 / Language] "
             f"请严格使用{label}撰写所有面向读者的文本（标题、正文、解释、提示、过渡句、"
             "题干、选项等），即使参考资料、JSON 字段名或英文术语出现在 prompt 中也"
             "不得切换语言；保留必要的专有名词原文（如人名、产品名、公式中的变量符号"
             f"等）即可，其余一律使用{label}。"
         )
+        return f"{body} {_OVERRIDE_ZH}" if allow_user_override else body
     if code == "en":
-        return (
+        body = (
             "\n\n[Language] Write ALL reader-facing text (titles, prose, "
             "explanations, hints, transitions, quiz stems, options, etc.) in "
             "English. Do NOT switch languages even if the source material, "
@@ -56,54 +95,53 @@ def language_directive(language: str | None) -> str:
             "Keep proper nouns (people, products, formula symbols) in their "
             "original form."
         )
-    return (
+        return f"{body} {_OVERRIDE_EN}" if allow_user_override else body
+    body = (
         f"\n\n[Language] Write ALL reader-facing text strictly in {label}. "
         "Do NOT switch languages even if the source material, JSON keys, or "
         "examples in this prompt are in a different language. Keep proper "
         "nouns (people, products, formula symbols) in their original form."
     )
+    return f"{body} {_OVERRIDE_EN}" if allow_user_override else body
 
 
-def reasoning_language_directive(language: str | None) -> str:
-    """Return an instruction that keeps internal reasoning in one language.
-
-    Unlike :func:`language_directive`, which only governs reader-facing text,
-    this applies to the model's hidden chain of thought and to internal memos
-    that later stages may surface in the reasoning trace UI.
-    """
-    code = normalize_language(language)
-    label = language_label(code)
-    if code.startswith("zh"):
-        return (
-            "\n\n[内部语言 / Internal language] "
-            f"你的全部内部推理、分析、备忘与输出都必须使用{label}；"
-            "可以保留必要的英文专有名词、模型名、代码片段与公式，"
-            "但不要用英文书写思考过程。"
-        )
-    if code == "en":
-        return (
-            "\n\n[Internal language] Think and write ALL internal reasoning, "
-            "analysis, notes, and output in English. Keep proper nouns, model "
-            "names, code snippets, and formulas in their original form when needed."
-        )
-    return (
-        f"\n\n[Internal language] Think and write ALL internal reasoning, "
-        f"analysis, notes, and output in {label}."
-    )
-
-
-def append_language_directive(system_prompt: str | None, language: str | None) -> str:
+def append_language_directive(
+    system_prompt: str | None,
+    language: str | None,
+    *,
+    allow_user_override: bool = False,
+) -> str:
     """Append the language directive to an existing system prompt."""
     base = (system_prompt or "").rstrip()
-    directive = language_directive(language).strip()
+    directive = language_directive(language, allow_user_override=allow_user_override).strip()
     if not base:
         return directive
     return f"{base}\n\n{directive}"
 
 
-def append_reasoning_language_directive(
-    system_prompt: str | None, language: str | None
-) -> str:
+def reasoning_language_directive(language: str | None) -> str:
+    """Return an instruction that keeps *internal reasoning* in the same language.
+
+    The reader-facing directive only governs the text the user sees; without
+    this clause a Chinese answer is routinely prepared by an English chain of
+    thought, which leaks into progress notes and trace panels.
+    """
+    code = normalize_language(language)
+    if code.startswith("zh"):
+        return (
+            "\n\n[内部语言 / Internal language] 你的全部内部推理、分析、备忘与工作笔记都必须"
+            "使用中文（简体）；可以保留必要的英文专有名词、模型名、代码片段与公式，"
+            "但不要用英文书写思考过程。"
+        )
+    label = language_label(code)
+    return (
+        f"\n\n[Internal language] Keep all internal reasoning, analysis, notes and work logs "
+        f"in {label}. Proper nouns, model names, code snippets and formulas may stay as-is, "
+        "but do not think in another language."
+    )
+
+
+def append_reasoning_language_directive(system_prompt: str | None, language: str | None) -> str:
     """Append the internal-reasoning language directive to a system prompt."""
     base = (system_prompt or "").rstrip()
     directive = reasoning_language_directive(language).strip()
@@ -115,6 +153,7 @@ def append_reasoning_language_directive(
 __all__ = [
     "append_language_directive",
     "append_reasoning_language_directive",
+    "is_chinese",
     "language_directive",
     "language_label",
     "normalize_language",

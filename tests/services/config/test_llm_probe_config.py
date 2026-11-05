@@ -40,7 +40,18 @@ class TestGetAgentParamsLlmProbe:
         params = get_agent_params("llm_probe")
         assert params["max_tokens"] == 2048
 
-    def test_uses_default_when_section_absent(self, tmp_path: Path, monkeypatch):
+    def test_uses_the_seeded_probe_defaults_when_the_section_is_absent(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """A stale agents.yaml still gets the probe's own defaults.
+
+        `get_agent_params` falls back to `DEFAULT_AGENTS_SETTINGS` before the
+        generic 0.5/4096, so seeding `diagnostics.llm_probe` is what actually
+        sets this — the module-level constant in `test_runner` is unreachable,
+        since this function always returns both keys.
+        """
+        from deeptutor.services.setup.init import DEFAULT_AGENTS_SETTINGS
+
         project_root = _write_agents_yaml(
             tmp_path,
             {
@@ -49,8 +60,10 @@ class TestGetAgentParamsLlmProbe:
         )
         monkeypatch.setattr(loader_module, "PROJECT_ROOT", project_root)
         params = get_agent_params("llm_probe")
-        assert params["max_tokens"] == 4096
-        assert params["temperature"] == 0.5
+        seeded = DEFAULT_AGENTS_SETTINGS["diagnostics"]["llm_probe"]
+        assert params["max_tokens"] == seeded["max_tokens"] == 4096
+        # A diagnostic wants a reproducible answer, not a creative one.
+        assert params["temperature"] == seeded["temperature"] == 0.1
 
     def test_uses_default_when_max_tokens_key_absent(self, tmp_path: Path, monkeypatch):
         project_root = _write_agents_yaml(
@@ -104,17 +117,19 @@ class TestLlmProbeUsesAgentsYaml:
         from deeptutor.services import llm as llm_module
         from deeptutor.services.config import test_runner as test_runner_module
         from deeptutor.services.config.test_runner import ConfigTestRunner, TestRun
+        from deeptutor.services.llm import factory as llm_factory
 
         captured_kwargs: dict[str, Any] = {}
 
-        async def _fake_llm_complete(**kwargs):
+        async def _fake_llm_complete(_config, **kwargs):
             captured_kwargs.update(kwargs)
+            captured_kwargs["config"] = _config
             return "OK I am gpt-4o-mini"
 
         monkeypatch.setattr(
             test_runner_module,
             "resolve_llm_runtime_config",
-            lambda catalog: _stub_resolved_llm(),
+            lambda catalog, **kwargs: _stub_resolved_llm(),
         )
         monkeypatch.setattr(
             test_runner_module,
@@ -122,7 +137,7 @@ class TestLlmProbeUsesAgentsYaml:
             _stub_context_window_detection,
         )
         monkeypatch.setattr(llm_module, "get_token_limit_kwargs", _real_get_token_limit_kwargs)
-        monkeypatch.setattr(llm_module, "complete", _fake_llm_complete)
+        monkeypatch.setattr(llm_factory, "complete_with_config", _fake_llm_complete)
         monkeypatch.setattr(llm_module, "clear_llm_config_cache", lambda: None)
 
         runner = ConfigTestRunner()
@@ -132,6 +147,10 @@ class TestLlmProbeUsesAgentsYaml:
         assert (
             captured_kwargs.get("max_tokens") == 768
             or captured_kwargs.get("max_completion_tokens") == 768
+        )
+        assert any(
+            "Basic LLM completion succeeded" in str(event.get("message", ""))
+            for event in run.events
         )
 
     @pytest.mark.asyncio
@@ -143,17 +162,19 @@ class TestLlmProbeUsesAgentsYaml:
         from deeptutor.services import llm as llm_module
         from deeptutor.services.config import test_runner as test_runner_module
         from deeptutor.services.config.test_runner import ConfigTestRunner, TestRun
+        from deeptutor.services.llm import factory as llm_factory
 
         captured_kwargs: dict[str, Any] = {}
 
-        async def _fake_llm_complete(**kwargs):
+        async def _fake_llm_complete(_config, **kwargs):
             captured_kwargs.update(kwargs)
+            captured_kwargs["config"] = _config
             return "OK I am gpt-4o-mini"
 
         monkeypatch.setattr(
             test_runner_module,
             "resolve_llm_runtime_config",
-            lambda catalog: _stub_resolved_llm(),
+            lambda catalog, **kwargs: _stub_resolved_llm(),
         )
         monkeypatch.setattr(
             test_runner_module,
@@ -161,7 +182,7 @@ class TestLlmProbeUsesAgentsYaml:
             _stub_context_window_detection,
         )
         monkeypatch.setattr(llm_module, "get_token_limit_kwargs", _real_get_token_limit_kwargs)
-        monkeypatch.setattr(llm_module, "complete", _fake_llm_complete)
+        monkeypatch.setattr(llm_factory, "complete_with_config", _fake_llm_complete)
         monkeypatch.setattr(llm_module, "clear_llm_config_cache", lambda: None)
 
         runner = ConfigTestRunner()
@@ -174,13 +195,56 @@ class TestLlmProbeUsesAgentsYaml:
         )
 
     @pytest.mark.asyncio
-    async def test_probe_persists_detected_context_window_when_catalog_present(
+    async def test_probe_passes_runtime_api_version_and_reasoning_effort(self, monkeypatch):
+        from deeptutor.services import llm as llm_module
+        from deeptutor.services.config import test_runner as test_runner_module
+        from deeptutor.services.config.test_runner import ConfigTestRunner, TestRun
+        from deeptutor.services.llm import factory as llm_factory
+
+        captured_kwargs: dict[str, Any] = {}
+
+        async def _fake_llm_complete(_config, **kwargs):
+            captured_kwargs.update(kwargs)
+            captured_kwargs["config"] = _config
+            return "OK I am a reasoning model"
+
+        monkeypatch.setattr(
+            test_runner_module,
+            "resolve_llm_runtime_config",
+            lambda catalog, **kwargs: _stub_resolved_llm(
+                api_version="2026-05-01",
+                api_format="openai_responses",
+                wire_api="responses",
+                reasoning_effort="high",
+            ),
+        )
+        monkeypatch.setattr(
+            test_runner_module,
+            "detect_context_window",
+            _stub_context_window_detection,
+        )
+        monkeypatch.setattr(llm_module, "get_token_limit_kwargs", _real_get_token_limit_kwargs)
+        monkeypatch.setattr(llm_factory, "complete_with_config", _fake_llm_complete)
+        monkeypatch.setattr(llm_module, "clear_llm_config_cache", lambda: None)
+
+        runner = ConfigTestRunner()
+        run = TestRun(id="test-llm-probe-runtime-fields", service="llm")
+        await runner._test_llm(run, catalog={})
+
+        assert captured_kwargs["config"].api_version == "2026-05-01"
+        assert captured_kwargs["config"].reasoning_effort == "high"
+        assert captured_kwargs["config"].api_format == "openai_responses"
+        assert captured_kwargs["config"].wire_api == "responses"
+
+    @pytest.mark.asyncio
+    async def test_probe_reports_detected_context_window_without_persisting_catalog(
         self, tmp_path, monkeypatch
     ):
         from deeptutor.services import llm as llm_module
         from deeptutor.services.config import test_runner as test_runner_module
         from deeptutor.services.config.model_catalog import ModelCatalogService
         from deeptutor.services.config.test_runner import ConfigTestRunner, TestRun
+        from deeptutor.services.llm import factory as llm_factory
 
         catalog = {
             "version": 1,
@@ -218,7 +282,7 @@ class TestLlmProbeUsesAgentsYaml:
         service = ModelCatalogService(path=tmp_path / "model_catalog.json")
         service.save(catalog)
 
-        async def _fake_llm_complete(**_kwargs):
+        async def _fake_llm_complete(_config, **_kwargs):
             return "OK I am gpt-4o-mini"
 
         monkeypatch.setattr(
@@ -229,17 +293,15 @@ class TestLlmProbeUsesAgentsYaml:
         monkeypatch.setattr(
             test_runner_module,
             "resolve_llm_runtime_config",
-            lambda catalog: _stub_resolved_llm(),
+            lambda catalog, **kwargs: _stub_resolved_llm(),
         )
         monkeypatch.setattr(
             test_runner_module,
             "detect_context_window",
             _stub_metadata_context_window_detection,
         )
-        monkeypatch.setattr(test_runner_module, "clear_llm_config_cache", lambda: None)
-        monkeypatch.setattr(test_runner_module, "reset_llm_client", lambda: None)
         monkeypatch.setattr(llm_module, "get_token_limit_kwargs", _real_get_token_limit_kwargs)
-        monkeypatch.setattr(llm_module, "complete", _fake_llm_complete)
+        monkeypatch.setattr(llm_factory, "complete_with_config", _fake_llm_complete)
         monkeypatch.setattr(llm_module, "clear_llm_config_cache", lambda: None)
 
         runner = ConfigTestRunner()
@@ -248,10 +310,14 @@ class TestLlmProbeUsesAgentsYaml:
 
         saved = service.load()
         saved_model = saved["services"]["llm"]["profiles"][0]["models"][0]
-        assert saved_model["context_window"] == "128000"
-        assert saved_model["context_window_source"] == "metadata"
-        assert saved_model["context_window_detected_at"] == "2026-04-24T08:00:00+00:00"
-        assert any(event["type"] == "catalog" for event in run.events)
+        assert "context_window" not in saved_model
+        assert "context_window_source" not in saved_model
+        assert "context_window_detected_at" not in saved_model
+        context_event = next(event for event in run.events if event["type"] == "context_window")
+        assert context_event["context_window"] == 128000
+        assert context_event["source"] == "metadata"
+        assert context_event["detected_at"] == "2026-04-24T08:00:00+00:00"
+        assert not any(event["type"] == "catalog" for event in run.events)
 
 
 # ---------------------------------------------------------------------------
@@ -259,21 +325,25 @@ class TestLlmProbeUsesAgentsYaml:
 # ---------------------------------------------------------------------------
 
 
-def _stub_resolved_llm():
+def _stub_resolved_llm(**overrides: Any):
     """Return a minimal resolved LLM config stub."""
     from deeptutor.services.config.provider_runtime import ResolvedLLMConfig
 
+    values = {
+        "model": "gpt-4o-mini",
+        "api_key": "sk-test",
+        "base_url": "https://api.example.com/v1",
+        "effective_url": "https://api.example.com/v1",
+        "binding": "openai",
+        "provider_name": "openai",
+        "provider_mode": "standard",
+        "api_version": "",
+        "extra_headers": {},
+        "reasoning_effort": None,
+    }
+    values.update(overrides)
     return ResolvedLLMConfig(
-        model="gpt-4o-mini",
-        api_key="sk-test",
-        base_url="https://api.example.com/v1",
-        effective_url="https://api.example.com/v1",
-        binding="openai",
-        provider_name="openai",
-        provider_mode="standard",
-        api_version="",
-        extra_headers={},
-        reasoning_effort=None,
+        **values,
     )
 
 

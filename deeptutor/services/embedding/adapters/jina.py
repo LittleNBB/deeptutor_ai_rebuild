@@ -5,15 +5,31 @@ from typing import Any, Dict
 
 import httpx
 
+from deeptutor.services.embedding.request_options import should_send_embedding_dimensions
+from deeptutor.services.llm.openai_http_client import disable_ssl_verify_enabled
+
 from .base import BaseEmbeddingAdapter, EmbeddingRequest, EmbeddingResponse
 
 logger = logging.getLogger(__name__)
 
 
 class JinaEmbeddingAdapter(BaseEmbeddingAdapter):
+    # Jina ignores `input_type` unless explicitly opted in. Enabling it changes
+    # vectors for both documents and queries, so the embedding signature must
+    # distinguish pre-role Jina indexes.
+    SUPPORTS_INPUT_TYPE = True
+
     MODELS_INFO = {
-        "jina-embeddings-v3": {"default": 1024, "dimensions": [32, 64, 128, 256, 512, 768, 1024]},
-        "jina-embeddings-v4": {"default": 1024, "dimensions": [32, 64, 128, 256, 512, 768, 1024]},
+        "jina-embeddings-v3": {
+            "default": 1024,
+            "dimensions": [32, 64, 128, 256, 512, 768, 1024],
+            "multimodal": False,
+        },
+        "jina-embeddings-v4": {
+            "default": 1024,
+            "dimensions": [32, 64, 128, 256, 512, 768, 1024],
+            "multimodal": True,
+        },
     }
 
     INPUT_TYPE_TO_TASK = {
@@ -26,20 +42,26 @@ class JinaEmbeddingAdapter(BaseEmbeddingAdapter):
 
     def _should_send_dimensions(self, model_name: str | None, dim: int) -> bool:
         """Decide whether to attach `dimensions` (Matryoshka truncation)."""
-        if self.send_dimensions is True:
-            return True
-        if self.send_dimensions is False:
-            return False
+        decision = should_send_embedding_dimensions(
+            binding="jina",
+            model=model_name,
+            dimension=dim,
+            send_dimensions=self.send_dimensions,
+        )
+        if self.send_dimensions is not None or decision:
+            return decision
         info = self.MODELS_INFO.get(model_name or "", {})
         supported = info.get("dimensions") if isinstance(info, dict) else None
-        if isinstance(supported, list) and dim in supported:
-            return True
         if isinstance(supported, list):
             logger.warning(
                 f"Jina model '{model_name}' supports dims {supported} but {dim} requested; "
                 "dropping `dimensions` from payload."
             )
-        return False
+        return decision
+
+    def _supports_multimodal(self, model_name: str | None) -> bool:
+        info = self.MODELS_INFO.get(model_name or "")
+        return bool(isinstance(info, dict) and info.get("multimodal", False))
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
         headers = {
@@ -52,6 +74,11 @@ class JinaEmbeddingAdapter(BaseEmbeddingAdapter):
         # arrays in `input`; v3 is text-only. Treat `contents` as advisory:
         # if set, flatten each {"text"|"image"|"video": value} to its value.
         if request.contents:
+            if not self._supports_multimodal(request.model or self.model):
+                raise ValueError(
+                    f"Jina model '{request.model or self.model}' does not support "
+                    "multimodal `contents`."
+                )
             input_payload = [
                 next(iter(item.values())) for item in request.contents if isinstance(item, dict)
             ]
@@ -86,7 +113,9 @@ class JinaEmbeddingAdapter(BaseEmbeddingAdapter):
 
         logger.debug(f"Sending embedding request to {url} with {len(request.texts)} texts")
 
-        async with httpx.AsyncClient(timeout=self.request_timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=self.request_timeout, verify=not disable_ssl_verify_enabled()
+        ) as client:
             response = await client.post(url, json=payload, headers=headers)
 
             if response.status_code >= 400:
@@ -119,6 +148,7 @@ class JinaEmbeddingAdapter(BaseEmbeddingAdapter):
                 "dimensions": model_info.get("default", self.dimensions),
                 "supported_dimensions": model_info.get("dimensions", []),
                 "supports_variable_dimensions": True,
+                "multimodal": bool(model_info.get("multimodal", False)),
                 "provider": "jina",
             }
         else:
@@ -126,5 +156,6 @@ class JinaEmbeddingAdapter(BaseEmbeddingAdapter):
                 "model": self.model,
                 "dimensions": model_info or self.dimensions,
                 "supports_variable_dimensions": False,
+                "multimodal": False,
                 "provider": "jina",
             }

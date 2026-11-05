@@ -12,6 +12,9 @@ from typing import Any, Dict
 
 from openai import APIConnectionError, APIError, APIStatusError, AsyncOpenAI
 
+from deeptutor.services.embedding.request_options import should_send_embedding_dimensions
+from deeptutor.services.llm.openai_http_client import openai_client_kwargs
+
 from .base import (
     BaseEmbeddingAdapter,
     EmbeddingProviderError,
@@ -31,18 +34,12 @@ class OpenAISDKEmbeddingAdapter(BaseEmbeddingAdapter):
         Tri-state ``self.send_dimensions``: ``True`` always send, ``False``
         never send, ``None`` auto by model family.
         """
-        if self.send_dimensions is True:
-            return True
-        if self.send_dimensions is False:
-            return False
-        if not model_name:
-            return False
-        lname = model_name.lower()
-        if lname.startswith("text-embedding-3"):
-            return True
-        if "qwen3-embedding" in lname or "qwen3-vl-embedding" in lname:
-            return True
-        return False
+        return should_send_embedding_dimensions(
+            binding=None,
+            model=model_name,
+            dimension=self.dimensions or 1,
+            send_dimensions=self.send_dimensions,
+        )
 
     def _build_client(self) -> AsyncOpenAI:
         # OpenRouter / custom gateways often don't validate the key, but the
@@ -57,6 +54,7 @@ class OpenAISDKEmbeddingAdapter(BaseEmbeddingAdapter):
                 else None
             ),
             max_retries=2,
+            **openai_client_kwargs(timeout=max(self.request_timeout, 60)),
         )
 
     async def embed(self, request: EmbeddingRequest) -> EmbeddingResponse:
@@ -70,6 +68,9 @@ class OpenAISDKEmbeddingAdapter(BaseEmbeddingAdapter):
         kwargs: Dict[str, Any] = {
             "model": model,
             "input": request.texts,
+            # Unlike the gateway adapter (which omits `encoding_format` to avoid
+            # HTTP 400s), the official OpenAI/Azure API accepts it and callers
+            # expect float vectors, so pin "float" when none is set explicitly.
             "encoding_format": request.encoding_format or "float",
         }
         dim_value = request.dimensions or self.dimensions
@@ -144,5 +145,6 @@ class OpenAISDKEmbeddingAdapter(BaseEmbeddingAdapter):
             "model": self.model,
             "dimensions": self.dimensions,
             "supports_variable_dimensions": False,
+            "multimodal": False,
             "provider": "openai_sdk",
         }
