@@ -498,17 +498,29 @@ class OpenAICompatProvider(LLMProvider):
 
         usage_map = cls._maybe_mapping(usage_obj)
         if usage_map is not None:
-            return {
+            result: dict[str, int] = {
                 "prompt_tokens": int(usage_map.get("prompt_tokens") or 0),
                 "completion_tokens": int(usage_map.get("completion_tokens") or 0),
                 "total_tokens": int(usage_map.get("total_tokens") or 0),
             }
+            # Forward DeepSeek prompt-caching fields so downstream
+            # token_tracker can compute discounted costs.
+            for cache_field in ("prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
+                val = usage_map.get(cache_field)
+                if val is not None:
+                    result[cache_field] = int(val)
+            return result
         if usage_obj:
-            return {
+            result = {
                 "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0) or 0,
                 "completion_tokens": getattr(usage_obj, "completion_tokens", 0) or 0,
                 "total_tokens": getattr(usage_obj, "total_tokens", 0) or 0,
             }
+            for cache_field in ("prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
+                val = getattr(usage_obj, cache_field, None)
+                if val is not None:
+                    result[cache_field] = int(val)
+            return result
         return {}
 
     def _parse(self, response: Any) -> LLMResponse:

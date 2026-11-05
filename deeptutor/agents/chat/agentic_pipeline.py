@@ -34,7 +34,10 @@ from deeptutor.services.llm import (
     stream as llm_stream,
 )
 from deeptutor.services.prompt import get_prompt_manager
-from deeptutor.services.prompt.language import append_language_directive
+from deeptutor.services.prompt.language import (
+    append_language_directive,
+    append_reasoning_language_directive,
+)
 from deeptutor.tools.builtin import BUILTIN_TOOL_NAMES
 from deeptutor.utils.json_parser import parse_json_response
 
@@ -1348,11 +1351,12 @@ class AgenticChatPipeline:
         )
         has_kb = "rag" in enabled_tools and bool(context.knowledge_bases)
         kb_hint = self._t("thinking.kb_hint") if has_kb else ""
-        return self._t(
+        system_prompt = self._t(
             "thinking.system",
             tool_list=tool_list or self._fallback_empty_tool_list(),
             kb_hint=kb_hint,
         )
+        return append_reasoning_language_directive(system_prompt, self.language)
 
     def _selected_kbs(self, context: UnifiedContext) -> list[str]:
         return [str(kb).strip() for kb in context.knowledge_bases if str(kb).strip()]
@@ -1397,11 +1401,12 @@ class AgenticChatPipeline:
         )
         has_rag = "rag" in enabled_tools
         rag_hint = self._t("observing.rag_hint") if has_rag else ""
-        return self._t(
+        system_prompt = self._t(
             "observing.system",
             tool_list=tool_list or self._fallback_empty_tool_list(),
             rag_hint=rag_hint,
         )
+        return append_reasoning_language_directive(system_prompt, self.language)
 
     def _responding_system_prompt(self, enabled_tools: list[str]) -> str:
         tool_list = self.registry.build_prompt_text(
@@ -1416,7 +1421,8 @@ class AgenticChatPipeline:
             tool_list=tool_list or self._fallback_empty_tool_list(),
             rag_hint=rag_hint,
         )
-        return append_language_directive(system_prompt, self.language)
+        system_prompt = append_language_directive(system_prompt, self.language)
+        return append_reasoning_language_directive(system_prompt, self.language)
 
     def _acting_user_prompt(self, context: UnifiedContext, thinking_text: str) -> str:
         return self._t(

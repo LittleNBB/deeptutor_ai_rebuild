@@ -100,6 +100,11 @@ const nextConfig = {
   // This eliminates the need to copy the full node_modules into Docker production images
   output: "standalone",
 
+  // Allow 127.0.0.1 in dev to avoid "Blocked cross-origin request to
+  // Next.js dev resource" which silently breaks HMR and interactive
+  // features when the page is opened via 127.0.0.1 instead of localhost.
+  allowedDevOrigins: ["127.0.0.1"],
+
   // Move dev indicator to bottom-right corner
   devIndicators: {
     position: "bottom-right",

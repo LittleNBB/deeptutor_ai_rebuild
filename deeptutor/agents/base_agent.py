@@ -20,6 +20,7 @@ from deeptutor.config.settings import settings
 from deeptutor.logging import LLMStats
 from deeptutor.services.config import get_agent_params
 from deeptutor.services.llm import complete as llm_complete
+from deeptutor.services.llm import complete_with_response as llm_complete_with_response
 from deeptutor.services.llm import (
     get_llm_config,
     get_token_limit_kwargs,
@@ -308,12 +309,13 @@ class BaseAgent(ABC):
         user_prompt: str,
         response: str,
         stage: str | None = None,
+        usage: dict[str, int] | None = None,
     ):
         """
         Track token usage using available tracker.
 
         Supports:
-        1. External TokenTracker (if self.token_tracker is set)
+        1. External TokenTracker (if self.token_tracker is set) — with API usage data
         2. Shared LLMStats (always available)
 
         Args:
@@ -322,6 +324,7 @@ class BaseAgent(ABC):
             user_prompt: User prompt
             response: LLM response
             stage: Stage name (optional)
+            usage: Raw token usage dict from API (includes cache fields)
         """
         stage_label = stage or self.agent_name
 
@@ -335,6 +338,7 @@ class BaseAgent(ABC):
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     response_text=response,
+                    usage=usage,
                 )
             except Exception:
                 pass  # Don't let tracking errors affect main flow
@@ -463,8 +467,9 @@ class BaseAgent(ABC):
 
         # Call LLM via factory (routes to cloud or local provider)
         response = None
+        usage = None
         try:
-            response = await llm_complete(
+            response, usage = await llm_complete_with_response(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 model=model,
@@ -489,13 +494,14 @@ class BaseAgent(ABC):
         # Calculate duration
         call_duration = time.time() - start_time
 
-        # Track token usage
+        # Track token usage (with API usage data for accurate billing)
         self._track_tokens(
             model=model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             response=response,
             stage=stage_label,
+            usage=usage,
         )
 
         # Log output
@@ -625,6 +631,11 @@ class BaseAgent(ABC):
         # Track start time
         start_time = time.time()
         full_response = ""
+        stream_usage: dict[str, int] | None = None
+
+        def _on_stream_usage(usage: dict[str, int]) -> None:
+            nonlocal stream_usage
+            stream_usage = usage
 
         try:
             # Stream via factory (routes to cloud or local provider)
@@ -638,6 +649,7 @@ class BaseAgent(ABC):
                 binding=self.binding,
                 messages=messages,
                 max_retries=max_retries,
+                on_usage=_on_stream_usage,
                 **kwargs,
             ):
                 full_response += chunk
@@ -650,13 +662,14 @@ class BaseAgent(ABC):
                 )
                 yield chunk
 
-            # Track token usage after streaming completes
+            # Track token usage after streaming completes (with API usage data)
             self._track_tokens(
                 model=model,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 response=full_response,
                 stage=stage_label,
+                usage=stream_usage,
             )
 
             # Log output

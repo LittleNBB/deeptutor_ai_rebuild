@@ -242,6 +242,10 @@ function getTraceHeader(
     : title;
 }
 
+function stripThinkingMarkers(text: string) {
+  return text.replace(/<\/?think(?:ing)?\b[^>]*>/gi, "").trim();
+}
+
 function getTraceText(
   events: StreamEvent[],
   eventTypes: Array<StreamEvent["type"]>,
@@ -256,10 +260,14 @@ function getTraceText(
     (event) => String(getTraceMeta(event).trace_kind || "") === "llm_output",
   );
   if (explicitOutputs.length > 0) {
-    return explicitOutputs[explicitOutputs.length - 1].content;
+    return stripThinkingMarkers(
+      explicitOutputs[explicitOutputs.length - 1].content,
+    );
   }
 
-  return textEvents.map((event) => event.content).join("");
+  return stripThinkingMarkers(
+    textEvents.map((event) => event.content).join(""),
+  );
 }
 
 function formatTraceArgs(args: unknown) {

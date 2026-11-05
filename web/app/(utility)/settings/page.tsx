@@ -53,6 +53,7 @@ type CatalogProfile = {
   base_url: string;
   api_key: string;
   api_version: string;
+  reasoning_effort?: string;
   extra_headers?: Record<string, string> | string;
   proxy?: string;
   max_results?: number;
@@ -1594,6 +1595,29 @@ function SettingsPageContent() {
                         placeholder={t("Optional")}
                       />
                     </div>
+                    {activeService === "llm" && (
+                      <div>
+                        <div className="mb-1.5 text-[12px] text-[var(--muted-foreground)]">
+                          {t("Reasoning effort")}
+                        </div>
+                        <select
+                          className={selectClass}
+                          value={activeProfile.reasoning_effort || ""}
+                          onChange={(e) =>
+                            updateProfileField(
+                              "reasoning_effort",
+                              e.target.value,
+                            )
+                          }
+                        >
+                          <option value="">{t("Default")}</option>
+                          <option value="low">{t("Low")}</option>
+                          <option value="medium">{t("Medium")}</option>
+                          <option value="high">{t("High")}</option>
+                          <option value="max">{t("Max")}</option>
+                        </select>
+                      </div>
+                    )}
                     {activeService === "search" ? (
                       <div>
                         <div className="mb-1.5 text-[12px] text-[var(--muted-foreground)]">

@@ -64,6 +64,34 @@ def language_directive(language: str | None) -> str:
     )
 
 
+def reasoning_language_directive(language: str | None) -> str:
+    """Return an instruction that keeps internal reasoning in one language.
+
+    Unlike :func:`language_directive`, which only governs reader-facing text,
+    this applies to the model's hidden chain of thought and to internal memos
+    that later stages may surface in the reasoning trace UI.
+    """
+    code = normalize_language(language)
+    label = language_label(code)
+    if code.startswith("zh"):
+        return (
+            "\n\n[内部语言 / Internal language] "
+            f"你的全部内部推理、分析、备忘与输出都必须使用{label}；"
+            "可以保留必要的英文专有名词、模型名、代码片段与公式，"
+            "但不要用英文书写思考过程。"
+        )
+    if code == "en":
+        return (
+            "\n\n[Internal language] Think and write ALL internal reasoning, "
+            "analysis, notes, and output in English. Keep proper nouns, model "
+            "names, code snippets, and formulas in their original form when needed."
+        )
+    return (
+        f"\n\n[Internal language] Think and write ALL internal reasoning, "
+        f"analysis, notes, and output in {label}."
+    )
+
+
 def append_language_directive(system_prompt: str | None, language: str | None) -> str:
     """Append the language directive to an existing system prompt."""
     base = (system_prompt or "").rstrip()
@@ -73,9 +101,22 @@ def append_language_directive(system_prompt: str | None, language: str | None) -
     return f"{base}\n\n{directive}"
 
 
+def append_reasoning_language_directive(
+    system_prompt: str | None, language: str | None
+) -> str:
+    """Append the internal-reasoning language directive to a system prompt."""
+    base = (system_prompt or "").rstrip()
+    directive = reasoning_language_directive(language).strip()
+    if not base:
+        return directive
+    return f"{base}\n\n{directive}"
+
+
 __all__ = [
     "append_language_directive",
+    "append_reasoning_language_directive",
     "language_directive",
     "language_label",
     "normalize_language",
+    "reasoning_language_directive",
 ]

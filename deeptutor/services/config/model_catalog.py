@@ -151,6 +151,7 @@ class ModelCatalogService:
                         "base_url": summary.llm["host"],
                         "api_key": summary.llm["api_key"],
                         "api_version": summary.llm["api_version"],
+                        "reasoning_effort": summary.llm["reasoning_effort"],
                         "extra_headers": {},
                         "models": [
                             {
@@ -323,6 +324,7 @@ class ModelCatalogService:
             "LLM_API_KEY",
             "LLM_HOST",
             "LLM_API_VERSION",
+            "LLM_REASONING_EFFORT",
         }
         if llm_keys.intersection(env_values.keys()):
             profile, model = ensure_llm_profile()
@@ -340,6 +342,13 @@ class ModelCatalogService:
                 and profile.get("api_version") != summary.llm["api_version"]
             ):
                 profile["api_version"] = summary.llm["api_version"]
+                changed = True
+            if (
+                "LLM_REASONING_EFFORT" in env_values
+                and str(profile.get("reasoning_effort") or "")
+                != summary.llm["reasoning_effort"]
+            ):
+                profile["reasoning_effort"] = summary.llm["reasoning_effort"]
                 changed = True
             if "LLM_MODEL" in env_values:
                 if model.get("model") != summary.llm["model"]:

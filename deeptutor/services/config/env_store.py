@@ -200,6 +200,7 @@ class EnvStore:
             "LLM_API_KEY": str(llm_map.get("api_key") or ""),
             "LLM_HOST": str(llm_map.get("host") or ""),
             "LLM_API_VERSION": str(llm_map.get("api_version") or ""),
+            "LLM_REASONING_EFFORT": str(llm_map.get("reasoning_effort") or ""),
             "EMBEDDING_BINDING": str(embedding_map.get("binding") or "openai"),
             "EMBEDDING_MODEL": str(embedding_map.get("model") or ""),
             "EMBEDDING_API_KEY": str(embedding_map.get("api_key") or ""),
@@ -236,6 +237,16 @@ class EnvStore:
             "LLM_API_KEY": str((llm_profile or {}).get("api_key") or ""),
             "LLM_HOST": str((llm_profile or {}).get("base_url") or ""),
             "LLM_API_VERSION": str((llm_profile or {}).get("api_version") or ""),
+            "LLM_REASONING_EFFORT": str(
+                (llm_profile or {}).get("reasoning_effort")
+                if "reasoning_effort" in (llm_profile or {})
+                else (
+                    (llm_model or {}).get("reasoning_effort")
+                    or current.get(
+                        "LLM_REASONING_EFFORT", os.getenv("LLM_REASONING_EFFORT", "")
+                    )
+                )
+            ),
             "EMBEDDING_BINDING": str((embedding_profile or {}).get("binding") or "openai"),
             "EMBEDDING_MODEL": str((embedding_model or {}).get("model") or ""),
             "EMBEDDING_API_KEY": str((embedding_profile or {}).get("api_key") or ""),
