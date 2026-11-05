@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from deeptutor.core.context import Attachment, UnifiedContext
 from deeptutor.core.errors import (
     ConfigurationError,
@@ -62,9 +64,8 @@ class TestUnifiedContext:
         assert ctx.attachments == []
         assert ctx.config_overrides == {}
         assert ctx.language == "en"
-        assert ctx.notebook_context == ""
-        assert ctx.history_context == ""
         assert ctx.memory_context == ""
+        assert ctx.source_manifest == ""
         assert ctx.metadata == {}
 
     def test_mutable_defaults_are_independent(self) -> None:
@@ -85,9 +86,8 @@ class TestUnifiedContext:
             attachments=[att],
             config_overrides={"temperature": 0.5},
             language="zh",
-            notebook_context="some notes",
-            history_context="prior session",
             memory_context="user preference",
+            source_manifest='id=nb-1 name="Lecture" type=notebook preview="..."',
             metadata={"turn_id": "t1"},
         )
         assert ctx.session_id == "s1"
@@ -102,6 +102,21 @@ class TestUnifiedContext:
         ctx_empty = UnifiedContext(enabled_tools=[])
         assert ctx_none.enabled_tools is None
         assert ctx_empty.enabled_tools == []
+
+    def test_metadata_remains_json_serializable_when_runtime_state_is_private(self) -> None:
+        async def wait_for_reply() -> dict[str, str]:
+            return {"answer": "ready"}
+
+        ctx = UnifiedContext(metadata={"turn_id": "turn-1", "source": "web"})
+        ctx.runtime.wait_for_user_reply = wait_for_reply
+        ctx.extension("example")["private_object"] = object()
+
+        assert json.loads(json.dumps(ctx.metadata)) == {
+            "turn_id": "turn-1",
+            "source": "web",
+        }
+        assert "wait_for_user_reply" not in ctx.metadata
+        assert "example" not in ctx.metadata
 
 
 # ---------------------------------------------------------------------------

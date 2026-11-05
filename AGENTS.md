@@ -2,19 +2,27 @@
 
 ## Overview
 
-DeepTutor is an **agent-native** intelligent learning companion built around
-a two-layer plugin model (Tools + Capabilities) with three entry points:
-CLI, WebSocket API, and Python SDK.
+DeepTutor is an **agent-native** intelligent learning companion organized
+around a two-layer plugin model — single-shot **Tools** invoked by the
+LLM, and multi-stage **Capabilities** that take over a turn — exposed
+through three entry points: CLI, WebSocket API, and Python SDK. All three
+enter the durable turn application service before the shared turn engine
+routes a normalized context to the selected capability.
 
 ## Architecture
 
 ```
-Entry Points:  CLI (Typer)  |  WebSocket /api/v1/ws  |  Python SDK
+Entry Points:  CLI (Typer)  |  WebSocket /ws  |  Python SDK
                     ↓                   ↓                   ↓
               ┌─────────────────────────────────────────────────┐
-              │              ChatOrchestrator                    │
-              │   routes to ChatCapability (default)             │
-              │   or a selected deep Capability                  │
+              │          TurnApplicationService                 │
+              │   persists, coordinates, and replays turns      │
+              └──────────────────────┬──────────────────────────┘
+                                     ↓
+              ┌─────────────────────────────────────────────────┐
+              │       TurnEngine → ChatOrchestrator              │
+              │   routes UnifiedContext → selected Capability    │
+              │   (defaults to `chat`)                           │
               └──────────┬──────────────┬───────────────────────┘
                          │              │
               ┌──────────▼──┐  ┌────────▼──────────┐
@@ -23,133 +31,146 @@ Entry Points:  CLI (Typer)  |  WebSocket /api/v1/ws  |  Python SDK
               └──────────────┘  └────────────────────┘
 ```
 
+`TurnApplicationService` owns durable turn state and replay through the
+session store and runtime coordinator. Each execution uses a per-turn
+`StreamBus`; the orchestrator emits events, the turn runtime persists them,
+and adapters replay them to consumers. Runtime settings live in
+`data/user/settings/*.json` — project-root `.env` files are intentionally
+ignored.
+
 ### Level 1 — Tools
 
-Lightweight single-function tools the LLM calls on demand:
+Single-function tools the LLM picks on demand. Eight user-toggleable tools
+surface in `/settings/tools`:
 
-| Tool                | Description                                    |
-| ------------------- | ---------------------------------------------- |
-| `rag`               | Knowledge base retrieval (RAG)                 |
-| `web_search`        | Web search with citations                      |
-| `code_execution`    | Sandboxed Python execution                     |
-| `reason`            | Dedicated deep-reasoning LLM call              |
-| `brainstorm`        | Breadth-first idea exploration with rationale  |
-| `paper_search`      | arXiv academic paper search                    |
-| `geogebra_analysis` | Image → GeoGebra commands (4-stage vision pipeline) |
+| Tool                 | Description                                   |
+| -------------------- | --------------------------------------------- |
+| `brainstorm`         | Breadth-first idea exploration with rationale |
+| `web_search`         | Web search with citations                     |
+| `paper_search`       | arXiv preprint search                         |
+| `zotero_search`      | Search a configured Zotero library            |
+| `reason`             | Dedicated deep-reasoning LLM call             |
+| `geogebra_analysis`  | Analyze math images into GeoGebra commands    |
+| `imagegen`           | Generate images                               |
+| `videogen`           | Generate videos                               |
+
+`USER_TOGGLEABLE_TOOL_NAMES` in `deeptutor/tools/builtin/__init__.py` is the
+authoritative toggle list. Other built-ins are **context-gated** or
+capability-owned: `CONFIGURABLE_BUILTIN_TOOL_NAMES` declares the context-gated
+surface, while `deeptutor/agents/_shared/tool_composition.py` owns the mount
+rules (`ToolMountFlags`) and the always-available workspace tools. Examples
+include `rag`, memory and notebook tools, `read_skill`, deferred MCP/CLI tools,
+`exec`, `ask_user`, and mastery navigation. `--tool` selects from the
+user-toggleable whitelist; it does not bypass context or capability gates.
 
 ### Level 2 — Capabilities
 
-Multi-step agent pipelines that take over the conversation:
+Multi-stage pipelines that own the turn:
 
-| Capability       | Stages                                         |
-| ---------------- | ---------------------------------------------- |
-| `chat`           | responding (default, tool-augmented)           |
-| `deep_solve`     | planning → reasoning → writing                 |
-| `deep_question`  | ideation → evaluation → generation → validation |
+| Capability       | Stages                                                |
+| ---------------- | ----------------------------------------------------- |
+| `chat`           | exploring → responding (single agentic loop, default) |
+| `ask_questions`  | responding (chat loop forced through `ask_user`)      |
+| `deep_solve`     | responding (chat loop + solve planning tools)         |
+| `deep_question`  | ideation → generation                                 |
+| `deep_research`  | rephrasing → decomposing → researching → reporting    |
+| `visualize`      | analyzing → generating → reviewing (SVG / Chart.js / Mermaid / HTML; or routes to Manim sub-stages via `render_type`) |
+| `math_animator`  | concept_analysis → concept_design → code_generation → code_retry → summary → render_output |
+| `mastery_path`   | responding (Guided Learning — chat loop + mastery tools, gated per topic type) |
+| `immersive_reading` | responding (document- or timestamp-grounded media reading loop) |
+| `video_lesson`   | code_generation → render_check → render_output (Remotion lesson played live in the browser, with TTS narration) |
 
-### Playground Plugins
-
-Extended features in `deeptutor/plugins/`:
-
-| Plugin            | Type       | Description                          |
-| ----------------- | ---------- | ------------------------------------ |
-| `deep_research`   | playground | Multi-agent research + reporting     |
+All capabilities converge on `emit_capability_result()` in
+`deeptutor/agents/_shared/capability_result.py` so every turn emits the same envelope
+(response payload + `cost_summary` from `UsageTracker`). Status copy and
+prompts are i18n'd via `capabilities/prompts/{en,zh}/<name>.yaml`.
 
 ## CLI Usage
 
 ```bash
-# Install CLI
-pip install -e ".[cli]"
+# Install from the current dev source checkout
+python -m pip install -r requirements/full.txt
+python -m pip install -e . --no-deps
 
-# Run any capability (agent-first entry point)
+# Alternative in 1.7.0: choose one in a separate wheel environment
+python -m pip install "deeptutor[full]"  # Full app, CLI + Web/API
+python -m pip install deeptutor         # Core CLI/SDK (chat + ask_questions)
+python -m pip install deeptutor-cli     # Compatibility alias for core
+
+# Run any capability
 deeptutor run chat "Explain Fourier transform"
-deeptutor run deep_solve "Solve x^2=4" -t rag --kb my-kb
-deeptutor run deep_question "Linear algebra" --config num_questions=5
+deeptutor run deep_solve "Solve x^2=4" --kb my-kb
+deeptutor run visualize "Animate sine wave" --config render_mode=manim_video
 
 # Interactive REPL
 deeptutor chat
 # (inside the REPL: /regenerate or /retry re-runs the last user message)
 
-# Knowledge bases
+# Partners (IM-connected companions)
+deeptutor partner list
+
+# Knowledge bases, memory, server
 deeptutor kb list
 deeptutor kb create my-kb --doc textbook.pdf
-
-# Plugins & memory
-deeptutor plugin list
 deeptutor memory show
-
-# API server (requires .[server])
-deeptutor serve --port 8001
+deeptutor serve --port 8001       # API server only
+deeptutor start                   # backend + frontend together
 ```
+
+Examples beyond core require their owning modules; use `deeptutor module list`
+to inspect installed/enabled/ready states and `deeptutor plugin list` to discover
+registered capabilities and tools. Source Web startup also needs Node.js 22 LTS
+and `npm ci --legacy-peer-deps` in `web/`. CLI-only source users can skip frontend
+setup, but still need the full Python dependencies. Follow
+[Agent Setup](docs-for-dev/AGENT_SETUP.md) for credentials and verification.
 
 ## Key Files
 
-| Path                          | Purpose                              |
-| ----------------------------- | ------------------------------------ |
-| `deeptutor/runtime/orchestrator.py` | ChatOrchestrator — unified entry     |
-| `deeptutor/core/stream.py`          | StreamEvent protocol                 |
-| `deeptutor/core/stream_bus.py`      | Async event fan-out                  |
-| `deeptutor/core/tool_protocol.py`   | BaseTool abstract class              |
-| `deeptutor/core/capability_protocol.py` | BaseCapability abstract class    |
-| `deeptutor/core/context.py`         | UnifiedContext dataclass             |
-| `deeptutor/runtime/registry/tool_registry.py` | Tool discovery & registration |
-| `deeptutor/runtime/registry/capability_registry.py` | Capability discovery & registration |
-| `deeptutor/runtime/mode.py`         | RunMode (CLI vs SERVER)              |
-| `deeptutor/capabilities/`           | Built-in capability wrappers         |
-| `deeptutor/tools/builtin/`          | Built-in tool wrappers               |
-| `deeptutor/plugins/`                | Playground plugins                   |
-| `deeptutor/plugins/loader.py`       | Plugin discovery from manifest.yaml  |
-| `deeptutor_cli/main.py`             | Typer CLI entry point                |
-| `deeptutor/api/routers/unified_ws.py` | Unified WebSocket endpoint         |
-
-## Plugin Development
-
-Create a directory under `deeptutor/plugins/<name>/` with:
-
-```
-manifest.yaml     # name, version, type, description, stages
-capability.py     # class extending BaseCapability
-```
-
-Minimal `manifest.yaml`:
-```yaml
-name: my_plugin
-version: 0.1.0
-type: playground
-description: "My custom plugin"
-stages: [step1, step2]
-```
-
-Minimal `capability.py`:
-```python
-from deeptutor.core.capability_protocol import BaseCapability, CapabilityManifest
-from deeptutor.core.context import UnifiedContext
-from deeptutor.core.stream_bus import StreamBus
-
-class MyPlugin(BaseCapability):
-    manifest = CapabilityManifest(
-        name="my_plugin",
-        description="My custom plugin",
-        stages=["step1", "step2"],
-    )
-
-    async def run(self, context: UnifiedContext, stream: StreamBus) -> None:
-        async with stream.stage("step1", source=self.name):
-            await stream.content("Working on step 1...", source=self.name)
-        await stream.result({"response": "Done!"}, source=self.name)
-```
+| Path                                       | Purpose                              |
+| ------------------------------------------ | ------------------------------------ |
+| `deeptutor/runtime/orchestrator.py`        | `ChatOrchestrator` — unified entry   |
+| `deeptutor/runtime/launcher.py`            | Backend + frontend lifecycle / port discovery |
+| `deeptutor/runtime/registry/`              | Tool + Capability registries         |
+| `deeptutor/runtime/bootstrap/builtin_capabilities.py` | Built-in capability class paths |
+| `deeptutor/services/config/runtime_settings.py` | JSON settings + process-env overrides |
+| `deeptutor/services/subagent/`             | Local/remote agent connectors; register each backend in `registry.py` and its model options in `models.py` (Grok CLI uses native `streaming-json`) |
+| `deeptutor/core/stream.py`, `deeptutor/runtime/stream_bus.py` | StreamEvent protocol + async fan-out |
+| `deeptutor/core/tool_protocol.py`          | `BaseTool` + `ToolDefinition`         |
+| `deeptutor/core/capability_protocol.py`    | `TurnCapability` + `CapabilityManifest` |
+| `deeptutor/core/context.py`                | `UnifiedContext` dataclass            |
+| `deeptutor/tools/builtin/__init__.py`      | All built-in tool wrappers           |
+| `deeptutor/capabilities/`                  | Built-in capability implementations  |
+| `deeptutor/app/`                           | `DeepTutorApp` SDK facade + durable application service |
+| `deeptutor_cli/main.py`                    | Typer CLI entry point                |
+| `deeptutor/api/routers/unified_ws.py`      | Unified WebSocket endpoint           |
+| `apps/desktop/`                            | Open DeepTutor desktop apps for MacOS and Windows (Electron shell + bundled core; per-target builds in `platforms/`) |
 
 ## Dependency Layers
 
-Defined in `pyproject.toml` `[project.optional-dependencies]`. Mirrored as flat
-lists in `requirements/*.txt` for Docker/CI installs without source code.
+The 1.7.0 layout is modular; 1.6.15 and earlier packages use the
+previous layout. Core owns the CLI, SDK and shared runtime; feature wheels must
+match its version. `deeptutor-cli` is a metadata-only compatibility alias.
+For development, use source or [local wheels](docs-for-dev/MODULES.md).
 
+Module manifests own dependency groups; generated requirements files support
+source, Docker and CI installs. `pyproject.toml` stores extra templates under
+`tool.deeptutor.optional-dependencies`; `build_metadata.py` resolves same-version
+wheel pins. Source checkouts expose all modules and install external dependencies
+through `requirements/full.txt`, followed by `pip install -e . --no-deps`.
+Use the source helper for optional extras rather than installing feature wheels
+over the checkout:
+
+```bash
+python scripts/install_extras.py partners       # Partner channel SDKs
+python scripts/install_extras.py matrix         # Matrix channel without E2EE/libolm
+python scripts/install_extras.py matrix-e2e     # Matrix with end-to-end encryption
+python scripts/install_extras.py math-animator  # Manim; also needs system LaTeX/ffmpeg
+python scripts/install_extras.py dev            # Test / lint tooling
+python scripts/install_extras.py all            # Full + Manim + dev dependencies
 ```
-.[cli]            — CLI full (LLM + RAG + providers + document parsing)
-.[server]         — .[cli] + FastAPI/uvicorn (for Web/API)
-.[tutorbot]       — .[server] + TutorBot agent engine + channel SDKs
-.[matrix]         — Matrix channel for TutorBot (matrix-nio[e2e]; needs libolm)
-.[math-animator]  — Manim addon (for `deeptutor animate`)
-.[dev]            — .[server] + test/lint tools
-.[all]            — Everything above
-```
+
+Stop DeepTutor before module changes. Source supports `module enable/disable`;
+wheel environments also support `module install/uninstall`. Upgrading a legacy
+`deeptutor-cli` installation requires uninstalling it before installing the new
+packages, preserving the same `DEEPTUTOR_HOME`; see the setup guide. Validate
+with `python -m pip check`, `deeptutor module list`, and the setup readiness checks.

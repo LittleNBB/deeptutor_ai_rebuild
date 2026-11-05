@@ -3,68 +3,33 @@
 import React, { useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { normalizeMarkdownForDisplay } from "@/lib/markdown-display";
-import type { MarkdownRendererProps } from "./MarkdownRenderer";
-
-function extractText(children: React.ReactNode): string {
-  return React.Children.toArray(children)
-    .map((child) => {
-      if (typeof child === "string" || typeof child === "number") {
-        return String(child);
-      }
-
-      if (React.isValidElement<{ children?: React.ReactNode }>(child)) {
-        return extractText(child.props.children);
-      }
-
-      return "";
-    })
-    .join("");
-}
-
-function headingId(children: React.ReactNode): string | undefined {
-  const text = extractText(children)
-    .toLowerCase()
-    .replace(/[^\w\s-]/g, "")
-    .replace(/\s+/g, "-");
-  return text || undefined;
-}
-
-function hasRenderableChildren(children: React.ReactNode): boolean {
-  return (
-    extractText(children).replace(/[\s\u200B-\u200D\uFEFF]/g, "").length > 0
-  );
-}
-
-function hasRenderableDetailsBody(children: React.ReactNode): boolean {
-  return React.Children.toArray(children).some((child) => {
-    if (typeof child === "string" || typeof child === "number") {
-      return String(child).replace(/[\s\u200B-\u200D\uFEFF]/g, "").length > 0;
-    }
-
-    if (!React.isValidElement(child)) return false;
-    if (
-      typeof child.type === "string" &&
-      child.type.toLowerCase() === "summary"
-    ) {
-      return false;
-    }
-
-    return true;
-  });
-}
-
-function stripLeadingHashes(children: React.ReactNode): React.ReactNode {
-  const arr = React.Children.toArray(children);
-  if (arr.length > 0 && typeof arr[0] === "string") {
-    const cleaned = arr[0].replace(/^#{1,6}\s+/, "");
-    if (cleaned !== arr[0]) return [cleaned, ...arr.slice(1)];
-  }
-  return children;
-}
+import { rehypeDirAuto } from "@/lib/rehype-dir-auto";
+import { findCitationAnchor } from "@/lib/markdown-anchors";
+import {
+  citationAnchorIdFor,
+  markdownUrlTransform,
+  normalizeMarkdownForDisplay,
+  safeDecodeURIComponent,
+} from "@/lib/markdown-display";
+import {
+  InlineFileCard,
+  InlineWorkspaceImage,
+  makeFileLinkRemarkPlugin,
+  parseAttachmentHref,
+  useInlineFileCardContext,
+} from "@/components/common/InlineFileCard";
+import type { MarkdownRendererProps } from "./markdown-renderer-types";
+import {
+  extractMarkdownText as extractText,
+  hasRenderableDetailsBody,
+  hasRenderableMarkdownChildren as hasRenderableChildren,
+  markdownHeadingId as headingId,
+  stripLeadingMarkdownHashes as stripLeadingHashes,
+} from "./markdown-renderer-core";
 
 export default function SimpleMarkdownRenderer({
   content,
+  learningTextSize,
   className = "",
   variant = "default",
 }: MarkdownRendererProps) {
@@ -118,7 +83,7 @@ export default function SimpleMarkdownRenderer({
         {children}
       </div>
     ),
-    pre: ({ children }: any) => <>{children}</>,
+    pre: ({ children }: any) => <div dir="ltr">{children}</div>,
     code: ({ node, children }: any) => (
       <code className="rounded bg-[var(--muted)] px-1 py-0.5 font-mono text-[0.95em] text-[var(--foreground)]">
         {String(children).replace(/\n$/, "")}
@@ -286,7 +251,7 @@ export default function SimpleMarkdownRenderer({
     ),
     th: ({ node, ...props }: any) => (
       <th
-        className={`border-b border-[var(--border)] text-left font-semibold text-[var(--foreground)] ${cellPad}`}
+        className={`border-b border-[var(--border)] text-start font-semibold text-[var(--foreground)] ${cellPad}`}
         {...props}
       />
     ),
@@ -305,16 +270,20 @@ export default function SimpleMarkdownRenderer({
     tr: ({ node, ...props }: any) => (
       <tr className="transition-colors hover:bg-[var(--muted)]/60" {...props} />
     ),
-    pre: ({ children }: any) => <>{children}</>,
+    pre: ({ children }: any) => <div dir="ltr">{children}</div>,
     code: ({ node, children, ...props }: any) => {
       const raw = String(children).replace(/\n$/, "");
 
       if (raw.includes("\n")) {
+        // Compatibility fallback: keep multiline code readable when rich
+        // rendering is unavailable. This intentionally does not consume the
+        // code-block theme registry or line-number/wrapping settings; those
+        // apply only through RichCodeBlock when rich code rendering is enabled.
         return (
           <div
-            className={`md-code-block ${gap} overflow-hidden rounded-xl border border-[var(--border)] bg-[#292524]`}
+            className={`md-code-block ${gap} overflow-hidden rounded-xl border border-[var(--border)] bg-[#1f2937]`}
           >
-            <pre className="overflow-x-auto p-4 text-sm leading-relaxed text-[#D6D3D1]">
+            <pre className="overflow-x-auto p-4 text-sm leading-relaxed text-[#e5e7eb]">
               <code className="md-code-block__code" {...props}>
                 {raw}
               </code>
@@ -325,6 +294,7 @@ export default function SimpleMarkdownRenderer({
 
       return (
         <code
+          dir="ltr"
           className="md-inline-code rounded bg-[var(--muted)] px-1.5 py-0.5 font-mono text-[0.875em] text-[var(--foreground)]"
           {...props}
         >
@@ -333,6 +303,10 @@ export default function SimpleMarkdownRenderer({
       );
     },
     a: ({ node, href, children, title, ...props }: any) => {
+      const attachmentName = parseAttachmentHref(href);
+      if (attachmentName) {
+        return <InlineFileCard name={attachmentName} fallback={children} />;
+      }
       const isCitation = title === "citation";
       const isHashLink = href?.startsWith("#");
       const external =
@@ -341,9 +315,9 @@ export default function SimpleMarkdownRenderer({
       if (isCitation) {
         const label = extractText(children);
         const ids = label.split(/\s*,\s*/);
-        const scrollToRef = (event: React.MouseEvent) => {
+        const scrollToRef = (event: React.MouseEvent, id?: string) => {
           event.preventDefault();
-          const target = document.getElementById("references");
+          const target = findCitationAnchor(href, id);
           target?.scrollIntoView({ block: "start", behavior: "smooth" });
         };
         return (
@@ -357,12 +331,13 @@ export default function SimpleMarkdownRenderer({
               const prefix = prefixMatch?.[1] ?? "";
               const num =
                 prefix && prefixMatch ? id.slice(prefixMatch[0].length) : id;
+              const citationAnchor = citationAnchorIdFor(id);
               return (
-                <React.Fragment key={id}>
+                <React.Fragment key={`${id}-${idx}`}>
                   {idx > 0 && ", "}
                   <a
-                    href={href}
-                    onClick={scrollToRef}
+                    href={citationAnchor ? `#${citationAnchor}` : href}
+                    onClick={(event) => scrollToRef(event, id)}
                     className="cursor-pointer text-[var(--primary)] no-underline transition-colors hover:text-[var(--primary)]/70 hover:underline"
                   >
                     {prefix ? (
@@ -394,7 +369,7 @@ export default function SimpleMarkdownRenderer({
             if (!isHashLink || !href) return;
 
             event.preventDefault();
-            const targetId = decodeURIComponent(href.slice(1));
+            const targetId = safeDecodeURIComponent(href.slice(1));
             const target = document.getElementById(targetId);
             target?.scrollIntoView({ block: "start", behavior: "smooth" });
           }}
@@ -405,18 +380,31 @@ export default function SimpleMarkdownRenderer({
         </a>
       );
     },
-    img: ({ node, src, alt, ...props }: any) => (
-      <img
-        src={src}
-        alt={alt || ""}
-        loading="lazy"
-        className={`${gap} inline-block max-w-full rounded-lg border border-[var(--border)]`}
-        {...props}
-      />
-    ),
+    img: ({ node, src, alt, ...props }: any) => {
+      const attachmentName = parseAttachmentHref(src);
+      const className = `${gap} inline-block max-w-full rounded-lg border border-[var(--border)]`;
+      if (attachmentName) {
+        return (
+          <InlineWorkspaceImage
+            name={attachmentName}
+            alt={alt || ""}
+            className={className}
+          />
+        );
+      }
+      return (
+        <img
+          src={src}
+          alt={alt || ""}
+          loading="lazy"
+          className={className}
+          {...props}
+        />
+      );
+    },
     blockquote: ({ node, ...props }: any) => (
       <blockquote
-        className={`${gap} border-l-[3px] border-[var(--muted-foreground)] pl-4 italic text-[var(--muted-foreground)] [&>p]:mb-1`}
+        className={`${gap} border-s-[3px] border-[var(--muted-foreground)] ps-4 italic text-[var(--muted-foreground)] [&>p]:mb-1`}
         {...props}
       />
     ),
@@ -465,7 +453,21 @@ export default function SimpleMarkdownRenderer({
     [isTrace, variant],
   );
 
-  const remarkPlugins = useMemo(() => [remarkGfm], []);
+  // Linkify exact generated-filename mentions in the assistant's prose into
+  // clickable file links (no-op outside a chat message — fileCtx is null).
+  const fileCtx = useInlineFileCardContext();
+  const fileLinkPlugin = useMemo(
+    () =>
+      makeFileLinkRemarkPlugin(
+        fileCtx?.files ?? [],
+        fileCtx?.unresolvedRelativeLinksAsText,
+      ),
+    [fileCtx?.files, fileCtx?.unresolvedRelativeLinksAsText],
+  );
+  const remarkPlugins = useMemo(
+    () => (fileLinkPlugin ? [remarkGfm, fileLinkPlugin] : [remarkGfm]),
+    [fileLinkPlugin],
+  );
 
   const rootClasses = isTrace
     ? "md-renderer max-w-none font-sans text-[11px] leading-[1.55] text-[var(--muted-foreground)]"
@@ -474,8 +476,22 @@ export default function SimpleMarkdownRenderer({
       : "md-renderer prose prose-sm max-w-none font-serif";
 
   return (
-    <div className={`${rootClasses} ${className}`}>
-      <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
+    <div
+      className={`${rootClasses} ${className} ${learningTextSize && !isTrace ? "learning-text" : ""}`}
+      style={
+        learningTextSize && !isTrace
+          ? ({
+              "--learning-text-base": `${learningTextSize}px`,
+            } as React.CSSProperties)
+          : undefined
+      }
+    >
+      <ReactMarkdown
+        remarkPlugins={remarkPlugins}
+        rehypePlugins={[rehypeDirAuto]}
+        components={components}
+        urlTransform={markdownUrlTransform}
+      >
         {normalizedContent}
       </ReactMarkdown>
     </div>

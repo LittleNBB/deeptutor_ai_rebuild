@@ -2,26 +2,25 @@
 Web Search Base Provider - Abstract base class for all search providers
 
 This module defines the BaseSearchProvider class that all search providers must inherit from.
-All providers use a unified SEARCH_API_KEY environment variable.
+Providers read credentials from data/user/settings/model_catalog.json.
 """
 
 from abc import ABC, abstractmethod
 import logging
-import os
 from typing import Any
 
-from deeptutor.services.config import get_env_store
+from deeptutor.services.config import search_provider_credentials
 
 from .types import WebSearchResponse
 
-# Unified API key environment variable
+# Legacy name retained for provider metadata only.
 SEARCH_API_KEY_ENV = "SEARCH_API_KEY"
 
 
 class BaseSearchProvider(ABC):
     """Abstract base class for search providers.
 
-    All providers use a unified SEARCH_API_KEY environment variable.
+    Providers use the active Search profile from Settings > Search.
     Each provider has its own BASE_URL defined as a class constant.
     """
 
@@ -38,7 +37,7 @@ class BaseSearchProvider(ABC):
         Initialize the provider.
 
         Args:
-            api_key: API key for the provider. If not provided, will be read from SEARCH_API_KEY.
+            api_key: API key for the provider. If not provided, use the active Search profile.
             **kwargs: Additional configuration options.
         """
         self.logger = logging.getLogger(__name__)
@@ -47,17 +46,15 @@ class BaseSearchProvider(ABC):
         self.proxy = kwargs.get("proxy")
 
     def _get_api_key(self) -> str:
-        """Get API key from provider-specific env vars with SEARCH_API_KEY fallback."""
-        key = ""
-        for env_name in self.API_KEY_ENV_VARS:
-            key = get_env_store().get(env_name, "") or os.getenv(env_name, "")
-            if key:
-                break
+        """Get the API key from this provider's own search profile.
+
+        Looked up by provider rather than off the active profile, so a provider
+        that is configured but not currently active still finds its own key
+        instead of borrowing another vendor's.
+        """
+        key, _ = search_provider_credentials(self.name)
         if self.requires_api_key and not key:
-            raise ValueError(
-                f"{self.name} requires one of {self.API_KEY_ENV_VARS}. "
-                f"Please set it before using this provider."
-            )
+            raise ValueError(f"{self.name} requires an api_key in Settings > Search.")
         return key
 
     @abstractmethod
@@ -82,10 +79,8 @@ class BaseSearchProvider(ABC):
             bool: True if provider is available, False otherwise.
         """
         try:
-            if self.requires_api_key:
-                key = self.api_key or get_env_store().get(SEARCH_API_KEY_ENV, "")
-                if not key:
-                    return False
+            if self.requires_api_key and not self.api_key:
+                return False
             return True
         except (ValueError, ImportError):
             return False

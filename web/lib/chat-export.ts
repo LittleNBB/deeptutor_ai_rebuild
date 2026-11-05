@@ -1,15 +1,37 @@
-import type {
-  MessageItem,
-  MessageAttachment,
-} from "@/context/UnifiedChatContext";
+/**
+ * Minimal message/attachment shape the markdown exporter needs. Product chat's
+ * `MessageItem` satisfies it structurally, and partner conversations map into
+ * it too — so both surfaces share one serializer.
+ */
+export interface ExportableAttachment {
+  type?: string;
+  filename?: string;
+  mime_type?: string;
+}
 
-function roleHeading(role: MessageItem["role"]): string {
+export interface ExportableMessage {
+  role: string;
+  content: string;
+  /** Optional human-readable author for multi-speaker conversations. */
+  speaker?: string;
+  capability?: string;
+  attachments?: ExportableAttachment[];
+}
+
+function roleHeading(role: string): string {
   if (role === "user") return "User";
   if (role === "assistant") return "Assistant";
   return "System";
 }
 
-function formatAttachments(attachments?: MessageAttachment[]): string {
+function messageHeading(message: ExportableMessage): string {
+  // Keep an untrusted display name on one Markdown heading line. Markdown
+  // punctuation is harmless here, but line breaks could forge extra blocks.
+  const speaker = message.speaker?.trim().replace(/\s+/g, " ");
+  return speaker || roleHeading(message.role);
+}
+
+function formatAttachments(attachments?: ExportableAttachment[]): string {
   if (!attachments?.length) return "";
   const items = attachments
     .map((a) => {
@@ -26,7 +48,7 @@ export interface BuildChatMarkdownOptions {
 }
 
 export function buildChatMarkdown(
-  messages: MessageItem[],
+  messages: ExportableMessage[],
   options: BuildChatMarkdownOptions = {},
 ): string {
   const title = options.title?.trim() || "Chat Session";
@@ -34,7 +56,7 @@ export function buildChatMarkdown(
   const header = `# ${title}\n\n_Exported: ${exportedAt}_\n\n---\n\n`;
   const body = messages
     .map((msg) => {
-      const role = roleHeading(msg.role);
+      const role = messageHeading(msg);
       const cap = msg.capability ? ` _(${msg.capability})_` : "";
       const attachments = formatAttachments(msg.attachments);
       const content = (msg.content ?? "").trim();
@@ -53,7 +75,7 @@ function sanitizeFilename(input: string): string {
 }
 
 export function downloadChatMarkdown(
-  messages: MessageItem[],
+  messages: ExportableMessage[],
   options: BuildChatMarkdownOptions = {},
 ): void {
   if (!messages.length) return;

@@ -19,6 +19,45 @@ def _signature() -> EmbeddingSignature:
 
 
 @pytest.mark.asyncio
+async def test_reindex_receipt_excludes_a_file_skipped_by_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deeptutor.services.rag.pipelines.llamaindex import pipeline as pipeline_module
+    from deeptutor.services.rag.pipelines.llamaindex import storage as storage_module
+    from deeptutor.services.rag.pipelines.llamaindex.pipeline import LlamaIndexPipeline
+
+    raw_dir = tmp_path / "kb" / "raw"
+    raw_dir.mkdir(parents=True)
+    indexed = raw_dir / "indexed.txt"
+    skipped = raw_dir / "skipped.txt"
+    indexed.write_text("indexed content", encoding="utf-8")
+    skipped.write_text("   ", encoding="utf-8")
+
+    def create_index(documents, storage_dir: Path, *, show_progress: bool) -> None:
+        assert len(documents) == 1
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        (storage_dir / "docstore.json").write_text("{}", encoding="utf-8")
+        (storage_dir / "index_store.json").write_text("{}", encoding="utf-8")
+
+    async def verify_embedding(_self) -> None:
+        return None
+
+    monkeypatch.setattr(LlamaIndexPipeline, "_configure_settings", lambda _self: None)
+    monkeypatch.setattr(LlamaIndexPipeline, "_verify_embedding_connectivity", verify_embedding)
+    monkeypatch.setattr(pipeline_module, "set_progress_callback", lambda _callback: None)
+    monkeypatch.setattr(storage_module, "create_index", create_index)
+    monkeypatch.setattr(storage_module, "verify_persisted_index", lambda path: None)
+    pipeline = LlamaIndexPipeline(kb_base_dir=str(tmp_path), signature_provider=_signature)
+    receipts: list[list[str]] = []
+
+    assert await pipeline.initialize(
+        "kb", [str(indexed), str(skipped)], indexed_file_callback=receipts.append
+    )
+
+    assert receipts == [[str(indexed)]]
+
+
+@pytest.mark.asyncio
 async def test_incremental_add_migrates_matching_legacy_index_to_flat_version(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -44,11 +83,6 @@ async def test_incremental_add_migrates_matching_legacy_index_to_flat_version(
     captured: dict[str, str] = {}
 
     class _FakeStorageContext:
-        @classmethod
-        def from_defaults(cls, persist_dir: str):
-            captured["load_dir"] = persist_dir
-            return cls()
-
         def persist(self, persist_dir: str) -> None:
             captured["persist_dir"] = persist_dir
             target = Path(persist_dir)
@@ -63,6 +97,10 @@ async def test_incremental_add_migrates_matching_legacy_index_to_flat_version(
         def insert(self, document) -> None:
             self.inserted.append(document)
 
+    def _fake_load_index(storage_dir) -> _FakeIndex:
+        captured["load_dir"] = str(storage_dir)
+        return _FakeIndex()
+
     async def _verify_embedding_connectivity(self) -> None:
         return None
 
@@ -76,12 +114,8 @@ async def test_incremental_add_migrates_matching_legacy_index_to_flat_version(
         "_verify_embedding_connectivity",
         _verify_embedding_connectivity,
     )
-    monkeypatch.setattr(storage_module, "StorageContext", _FakeStorageContext)
-    monkeypatch.setattr(
-        storage_module,
-        "load_index_from_storage",
-        lambda _storage_context: _FakeIndex(),
-    )
+    monkeypatch.setattr(storage_module.vector_store, "load_index", _fake_load_index)
+    monkeypatch.setattr(storage_module, "verify_persisted_index", lambda path: None)
 
     pipeline = LlamaIndexPipeline(
         kb_base_dir=str(tmp_path),
@@ -95,3 +129,182 @@ async def test_incremental_add_migrates_matching_legacy_index_to_flat_version(
     assert captured["persist_dir"] == str(flat_storage_dir)
     assert (flat_storage_dir / "docstore.json").exists()
     assert json.loads((flat_storage_dir / "meta.json").read_text())["signature"] == sig.hash()
+
+
+def test_hybrid_retriever_uses_official_query_fusion_when_bm25_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deeptutor.services.rag.pipelines.llamaindex import retrievers as retriever_module
+    from deeptutor.services.rag.pipelines.llamaindex.config import RetrievalConfig
+
+    captured: dict[str, object] = {}
+
+    class _FakeVectorRetriever:
+        def __init__(self, top_k: int) -> None:
+            self.top_k = top_k
+
+    class _FakeIndex:
+        def as_retriever(self, similarity_top_k: int):
+            captured["vector_top_k"] = similarity_top_k
+            return _FakeVectorRetriever(similarity_top_k)
+
+    class _FakeBM25:
+        @classmethod
+        def from_defaults(cls, index, similarity_top_k: int):
+            captured["bm25_top_k"] = similarity_top_k
+            return cls()
+
+    class _FakeFusion:
+        def __init__(self, retrievers, **kwargs):
+            captured["retrievers"] = retrievers
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(retriever_module, "_import_bm25_retriever", lambda: _FakeBM25)
+    monkeypatch.setattr(retriever_module, "QueryFusionRetriever", _FakeFusion)
+
+    retriever = retriever_module.build_retriever(
+        _FakeIndex(),
+        tmp_path,
+        top_k=4,
+        config=RetrievalConfig(profile="hybrid"),
+    )
+
+    assert isinstance(retriever, _FakeFusion)
+    assert captured["vector_top_k"] == 8
+    assert captured["bm25_top_k"] == 8
+    assert captured["kwargs"]["similarity_top_k"] == 4
+    assert captured["kwargs"]["num_queries"] == 1
+
+
+def test_hybrid_retriever_falls_back_to_vector_when_bm25_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deeptutor.services.rag.pipelines.llamaindex import retrievers as retriever_module
+    from deeptutor.services.rag.pipelines.llamaindex.config import RetrievalConfig
+
+    calls: list[int] = []
+
+    class _FakeIndex:
+        def as_retriever(self, similarity_top_k: int):
+            calls.append(similarity_top_k)
+            return {"top_k": similarity_top_k}
+
+    monkeypatch.setattr(retriever_module, "_import_bm25_retriever", lambda: None)
+
+    retriever = retriever_module.build_retriever(
+        _FakeIndex(),
+        tmp_path,
+        top_k=4,
+        config=RetrievalConfig(profile="hybrid"),
+    )
+
+    assert retriever == {"top_k": 4}
+    assert calls == [4]
+
+
+def test_bm25_retriever_overrides_persisted_top_k(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deeptutor.services.rag.pipelines.llamaindex import retrievers as retriever_module
+
+    persist_dir = tmp_path / retriever_module.BM25_PERSIST_DIRNAME
+    persist_dir.mkdir()
+
+    class _FakeBM25:
+        def __init__(self) -> None:
+            self.similarity_top_k = 99
+
+        @classmethod
+        def from_persist_dir(cls, path: str):
+            assert path == str(persist_dir)
+            return cls()
+
+    monkeypatch.setattr(retriever_module, "_import_bm25_retriever", lambda: _FakeBM25)
+
+    retriever = retriever_module.build_bm25_retriever(object(), tmp_path, top_k=6)
+
+    assert retriever.similarity_top_k == 6
+
+
+def test_bm25_persistence_drops_stale_sidecar_on_rebuild_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deeptutor.services.rag.pipelines.llamaindex import retrievers as retriever_module
+
+    persist_dir = tmp_path / retriever_module.BM25_PERSIST_DIRNAME
+    persist_dir.mkdir()
+    (persist_dir / "old.json").write_text("stale", encoding="utf-8")
+
+    class _FailingBM25:
+        @classmethod
+        def from_defaults(cls, index, similarity_top_k: int):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(retriever_module, "_import_bm25_retriever", lambda: _FailingBM25)
+
+    assert retriever_module.persist_bm25_retriever(object(), tmp_path, top_k=6) is False
+    assert not persist_dir.exists()
+
+
+def test_retrieval_config_reads_profile_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from deeptutor.services.rag.pipelines.llamaindex import config as config_module
+
+    monkeypatch.setenv("DEEPTUTOR_RAG_RETRIEVAL_PROFILE", " vector ")
+
+    config = config_module.retrieval_config_from_env()
+
+    assert config.profile == config_module.VECTOR_PROFILE
+
+
+# ── #1792: the configured retrieval profile must not silently differ from
+# the effective one when the BM25 package is missing (Python 3.14 installs).
+
+
+def test_bm25_available_reflects_the_import_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    from deeptutor.services.rag.pipelines.llamaindex import retrievers as retriever_module
+
+    monkeypatch.setattr(retriever_module, "_import_bm25_retriever", lambda: object)
+    assert retriever_module.bm25_available() is True
+
+    monkeypatch.setattr(retriever_module, "_import_bm25_retriever", lambda: None)
+    assert retriever_module.bm25_available() is False
+
+
+def test_effective_profile_degrades_hybrid_to_vector_without_bm25(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deeptutor.services.rag.pipelines.llamaindex import retrievers as retriever_module
+
+    monkeypatch.setattr(retriever_module, "_import_bm25_retriever", lambda: None)
+    assert retriever_module.effective_retrieval_profile("hybrid") == "vector"
+    # Non-hybrid profiles are unaffected by BM25 availability.
+    assert retriever_module.effective_retrieval_profile("vector") == "vector"
+
+    monkeypatch.setattr(retriever_module, "_import_bm25_retriever", lambda: object)
+    assert retriever_module.effective_retrieval_profile("hybrid") == "hybrid"
+
+
+def test_hybrid_fallback_to_vector_warns_instead_of_staying_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    from deeptutor.services.rag.pipelines.llamaindex import retrievers as retriever_module
+    from deeptutor.services.rag.pipelines.llamaindex.config import RetrievalConfig
+
+    class _FakeIndex:
+        def as_retriever(self, similarity_top_k: int):
+            return {"top_k": similarity_top_k}
+
+    monkeypatch.setattr(retriever_module, "_import_bm25_retriever", lambda: None)
+
+    with caplog.at_level(logging.WARNING, logger=retriever_module.__name__):
+        retriever_module.build_retriever(
+            _FakeIndex(),
+            tmp_path,
+            top_k=4,
+            config=RetrievalConfig(profile="hybrid"),
+        )
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("vector-only" in r.getMessage() for r in warnings)

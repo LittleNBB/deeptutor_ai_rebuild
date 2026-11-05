@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -33,16 +34,14 @@ class _Signature:
 def _create_ready_version(
     kb_dir: Path, version: int = 1, signature: str = ACTIVE_SIGNATURE
 ) -> None:
-    """Create a flat version-N directory recognised as ready by index_versioning.
-
-    ``_is_storage_ready`` only requires at least one non-meta file inside the
-    version dir, so a single ``docstore.json`` is sufficient. ``meta.json`` is
-    written with the active signature so the embedding reconcile logic does
-    not flag the KB as needs_reindex.
-    """
+    """Create a flat version-N directory recognised as queryable by LlamaIndex."""
     version_dir = kb_dir / f"version-{version}"
     version_dir.mkdir(parents=True, exist_ok=True)
-    (version_dir / "docstore.json").write_text("{}", encoding="utf-8")
+    (version_dir / "docstore.json").write_text(
+        json.dumps({"docstore/data": {"doc-1": {}}}),
+        encoding="utf-8",
+    )
+    (version_dir / "index_store.json").write_text("{}", encoding="utf-8")
     (version_dir / "meta.json").write_text(
         json.dumps({"signature": signature, "version": f"version-{version}"}),
         encoding="utf-8",
@@ -96,6 +95,16 @@ def test_processing_with_ready_index_promotes_to_ready(
     assert info["statistics"]["rag_initialized"] is True
 
 
+def test_fresh_empty_kb_stays_ready_without_an_index_version(tmp_path: Path) -> None:
+    manager = KnowledgeBaseManager(base_dir=str(tmp_path))
+    manager.update_kb_status(name="empty", status="ready", progress=None)
+
+    info = manager.get_info("empty")
+
+    assert info["status"] == "ready"
+    assert info["statistics"]["rag_initialized"] is False
+
+
 def test_processing_with_completed_progress_and_ready_index_promotes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -112,6 +121,24 @@ def test_processing_with_completed_progress_and_ready_index_promotes(
     info = manager.get_info("kb2")
     assert info["status"] == "ready"
     assert info["progress"] is None
+
+
+def test_get_info_counts_nested_raw_documents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_active_embedding(monkeypatch)
+    manager = KnowledgeBaseManager(base_dir=str(tmp_path))
+    kb_dir = tmp_path / "kb-nested"
+    raw_dir = kb_dir / "raw"
+    (raw_dir / "ModuleA").mkdir(parents=True)
+    (raw_dir / "ModuleA" / "a.pdf").write_text("%PDF-1.4\n", encoding="utf-8")
+    (raw_dir / "root.txt").write_text("hello", encoding="utf-8")
+    _create_ready_version(kb_dir)
+    manager.update_kb_status(name="kb-nested", status="ready", progress=None)
+
+    info = KnowledgeBaseManager(base_dir=str(tmp_path)).get_info("kb-nested")
+
+    assert info["statistics"]["raw_documents"] == 2
 
 
 def test_initializing_with_ready_index_promotes(
@@ -182,6 +209,52 @@ def test_ready_status_unaffected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert info["status"] == "ready"
 
 
+def test_ready_lightrag_with_failed_doc_status_reports_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_active_embedding(monkeypatch)
+    kb_dir = tmp_path / "kb-lightrag"
+    version_dir = kb_dir / "version-1"
+    version_dir.mkdir(parents=True)
+    (version_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "provider": "lightrag",
+                "signature": "lightrag",
+                "version": "version-1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (version_dir / "kv_store_doc_status.json").write_text(
+        json.dumps(
+            {
+                "doc-1": {
+                    "status": "failed",
+                    "file_path": "bad.docx",
+                    "error_msg": "'list' object has no attribute 'size'",
+                    "chunks_list": [],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = KnowledgeBaseManager(base_dir=str(tmp_path))
+    manager.config.setdefault("knowledge_bases", {})["kb-lightrag"] = {
+        "path": "kb-lightrag",
+        "rag_provider": "lightrag",
+        "status": "ready",
+    }
+    manager._save_config()
+
+    info = KnowledgeBaseManager(base_dir=str(tmp_path)).get_info("kb-lightrag")
+    assert info["status"] == "error"
+    assert info["progress"]["stage"] == "error"
+    assert "bad.docx" in info["progress"]["error"]
+    assert info["statistics"]["rag_initialized"] is False
+    assert info["statistics"]["index_versions"][0]["ready"] is False
+
+
 def test_needs_reindex_takes_precedence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``effective_needs_reindex`` is checked first — promotion to ready
     must not run when the on-disk version was indexed under a different
@@ -201,3 +274,43 @@ def test_needs_reindex_takes_precedence(tmp_path: Path, monkeypatch: pytest.Monk
 
     info = manager.get_info("kb7")
     assert info["status"] == "needs_reindex"
+
+
+def test_get_info_does_not_reparse_docstore_on_repeat_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``kb list`` / the knowledge API must not re-parse docstore.json per call.
+
+    Regression test for issue #859: probing every index version parses the
+    multi-MB LlamaIndex docstore.json, and get_info used to probe the same
+    versions two or three times per KB (scan, failure summary, active-match
+    re-probe). With the docstore-count cache and version reuse, a second
+    get_info call must not read the file again at all.
+    """
+    _patch_active_embedding(monkeypatch)
+    manager = KnowledgeBaseManager(base_dir=str(tmp_path))
+    manager.update_kb_status(name="kb-perf", status="ready")
+    _create_ready_version(tmp_path / "kb-perf")
+
+    from deeptutor.services.rag import index_probe as probe_module
+
+    real_read = probe_module._read_json
+    reads: list[str] = []
+
+    def counting_read(path: Path) -> dict[str, Any] | None:
+        reads.append(str(path))
+        return real_read(path)
+
+    monkeypatch.setattr(probe_module, "_read_json", counting_read)
+
+    info = manager.get_info("kb-perf")
+    assert info["status"] == "ready"
+    assert info["statistics"]["active_match"] is True
+    parses_after_first_call = len(reads)
+    assert parses_after_first_call == 1  # one docstore.json read for the probe
+
+    info_again = manager.get_info("kb-perf")
+    assert info_again["status"] == "ready"
+    assert info_again["statistics"]["active_match"] is True
+    # Cached count + reused version probes: no re-read of the docstore.
+    assert len(reads) == parses_after_first_call

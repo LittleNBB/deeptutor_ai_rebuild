@@ -6,46 +6,40 @@ Run this once after starting PocketBase for the first time:
 
     python scripts/pb_setup.py
 
-Requires POCKETBASE_URL, POCKETBASE_ADMIN_EMAIL, and POCKETBASE_ADMIN_PASSWORD
-to be set in your .env file (or exported as environment variables).
+Requires integrations.pocketbase_url, integrations.pocketbase_admin_email, and
+integrations.pocketbase_admin_password in data/user/settings/integrations.json.
 
-Safe to re-run — existing collections are left untouched.
+Safe to re-run — existing collections receive missing fields and indexes.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import sys
+import time
 
 # Allow running from project root without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Load .env if present.
-try:
-    from dotenv import load_dotenv
+from deeptutor.services.config import load_integrations_settings
 
-    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-except ImportError:
-    pass
-
-
-POCKETBASE_URL = os.getenv("POCKETBASE_URL", "").rstrip("/")
-ADMIN_EMAIL = os.getenv("POCKETBASE_ADMIN_EMAIL", "")
-ADMIN_PASSWORD = os.getenv("POCKETBASE_ADMIN_PASSWORD", "")
+_INTEGRATIONS = load_integrations_settings()
+POCKETBASE_BASE_URL = str(_INTEGRATIONS["pocketbase_url"]).rstrip("/")
+ADMIN_EMAIL = str(_INTEGRATIONS["pocketbase_admin_email"])
+ADMIN_PASSWORD = str(_INTEGRATIONS["pocketbase_admin_password"])
 
 
 def _require_env():
     missing = []
-    if not POCKETBASE_URL:
-        missing.append("POCKETBASE_URL")
+    if not POCKETBASE_BASE_URL:
+        missing.append("integrations.pocketbase_url")
     if not ADMIN_EMAIL:
-        missing.append("POCKETBASE_ADMIN_EMAIL")
+        missing.append("integrations.pocketbase_admin_email")
     if not ADMIN_PASSWORD:
-        missing.append("POCKETBASE_ADMIN_PASSWORD")
+        missing.append("integrations.pocketbase_admin_password")
     if missing:
-        print(f"ERROR: Missing required env vars: {', '.join(missing)}")
-        print("Set them in your .env file or export them before running this script.")
+        print(f"ERROR: Missing required integration settings: {', '.join(missing)}")
+        print("Set them in data/user/settings/integrations.json before running this script.")
         sys.exit(1)
 
 
@@ -57,7 +51,7 @@ def _get_client():
         print("Run: pip install pocketbase")
         sys.exit(1)
 
-    pb = PocketBase(POCKETBASE_URL)
+    pb = PocketBase(POCKETBASE_BASE_URL)
     pb.admins.auth_with_password(ADMIN_EMAIL, ADMIN_PASSWORD)
     return pb
 
@@ -70,9 +64,72 @@ def _existing_collections(pb) -> set[str]:
         return set()
 
 
+def _public_dict(value):
+    if isinstance(value, dict):
+        return dict(value)
+    return {key: item for key, item in vars(value).items() if not key.startswith("_")}
+
+
+def _sync_existing_collection(pb, schema: dict) -> None:
+    """Idempotently append v2 fields/indexes to an existing collection."""
+    record = next(item for item in pb.collections.get_full_list() if item.name == schema["name"])
+    current_fields = [_public_dict(item) for item in getattr(record, "schema", [])]
+    field_names = {field.get("name") for field in current_fields}
+    merged_fields = current_fields + [
+        field for field in schema.get("schema", []) if field["name"] not in field_names
+    ]
+    current_indexes = list(getattr(record, "indexes", []) or [])
+
+    # Add fields first: duplicate cleanup below writes the new failure columns
+    # before the partial unique index can be installed.
+    if len(merged_fields) != len(current_fields):
+        pb.collections.update(record.id, {"schema": merged_fields, "indexes": current_indexes})
+
+    if schema["name"] == "turns":
+        active = {"queued", "running", "waiting_input"}
+        rows = pb.collection("turns").get_full_list()
+        grouped: dict[str, list] = {}
+        for row in rows:
+            if getattr(row, "status", "") in active:
+                grouped.setdefault(getattr(row, "session_id", ""), []).append(row)
+        now = time.time()
+        for rows_for_session in grouped.values():
+            rows_for_session.sort(
+                key=lambda item: (
+                    float(getattr(item, "turn_updated_at", 0) or 0),
+                    getattr(item, "id", ""),
+                ),
+                reverse=True,
+            )
+            for duplicate in rows_for_session[1:]:
+                pb.collection("turns").update(
+                    duplicate.id,
+                    {
+                        "status": "failed",
+                        "error": "Duplicate active turn resolved during migration",
+                        "failure_code": "migration_duplicate_running",
+                        "turn_updated_at": now,
+                        "finished_at": now,
+                        "state_version": int(getattr(duplicate, "state_version", 1) or 1) + 1,
+                    },
+                )
+
+    desired_indexes = schema.get("indexes", [])
+    merged_indexes = current_indexes + [
+        index for index in desired_indexes if index not in current_indexes
+    ]
+    if merged_indexes != current_indexes:
+        pb.collections.update(record.id, {"schema": merged_fields, "indexes": merged_indexes})
+
+
 def _create_if_missing(pb, name: str, schema: dict, existing: set[str]):
     if name in existing:
-        print(f"  skip  {name} (already exists)")
+        try:
+            _sync_existing_collection(pb, schema)
+            print(f"  sync  {name}")
+        except Exception as exc:
+            print(f"  ERROR syncing {name}: {exc}")
+            raise
         return
     try:
         pb.collections.create(schema)
@@ -83,16 +140,23 @@ def _create_if_missing(pb, name: str, schema: dict, existing: set[str]):
 
 def main():
     _require_env()
-    print(f"Connecting to PocketBase at {POCKETBASE_URL} ...")
+    print(f"Connecting to PocketBase at {POCKETBASE_BASE_URL} ...")
     pb = _get_client()
     print("Authenticated as admin.")
 
     existing = _existing_collections(pb)
     print(f"Found {len(existing)} existing collection(s): {sorted(existing) or '(none)'}\n")
 
+    # Access control is enforced in the application layer, not by PocketBase
+    # collection rules: the backend connects with a single admin-authenticated
+    # client (see services/pocketbase_client.py), which bypasses collection
+    # RBAC entirely, so the rules below stay empty by design. Per-user session
+    # isolation is implemented in PocketBaseSessionStore by stamping every
+    # session row with ``user_id`` and filtering every query by the current
+    # user. Do NOT rely on these listRule/viewRule strings for isolation.
     collections = [
         # ----------------------------------------------------------------
-        # sessions
+        # sessions  (``user_id`` populated + filtered by PocketBaseSessionStore)
         # ----------------------------------------------------------------
         {
             "name": "sessions",
@@ -106,6 +170,8 @@ def main():
                 {"name": "preferences_json", "type": "json", "required": False},
                 {"name": "capability", "type": "text", "required": False},
                 {"name": "status", "type": "text", "required": False},
+                {"name": "session_created_at", "type": "number", "required": False},
+                {"name": "session_updated_at", "type": "number", "required": False},
             ],
             "listRule": "",
             "viewRule": "",
@@ -126,6 +192,7 @@ def main():
                 {"name": "capability", "type": "text", "required": False},
                 {"name": "events_json", "type": "json", "required": False},
                 {"name": "attachments_json", "type": "json", "required": False},
+                {"name": "metadata_json", "type": "json", "required": False},
                 {"name": "msg_created_at", "type": "number", "required": False},
             ],
             "listRule": "",
@@ -149,6 +216,18 @@ def main():
                 {"name": "turn_created_at", "type": "number", "required": False},
                 {"name": "turn_updated_at", "type": "number", "required": False},
                 {"name": "finished_at", "type": "number", "required": False},
+                {"name": "owner_id", "type": "text", "required": False},
+                {"name": "fencing_token", "type": "number", "required": False},
+                {"name": "state_version", "type": "number", "required": False},
+                {"name": "failure_code", "type": "text", "required": False},
+                {"name": "retryable", "type": "bool", "required": False},
+                {"name": "assistant_message_id", "type": "text", "required": False},
+            ],
+            "indexes": [
+                "CREATE UNIQUE INDEX idx_turns_turn_id ON turns (turn_id)",
+                "CREATE UNIQUE INDEX idx_turns_one_active_session ON turns (session_id) "
+                "WHERE status IN ('queued', 'running', 'waiting_input')",
+                "CREATE UNIQUE INDEX idx_turns_assistant_message ON turns (assistant_message_id)",
             ],
             "listRule": "",
             "viewRule": "",
@@ -172,6 +251,9 @@ def main():
                 {"name": "content", "type": "text", "required": False},
                 {"name": "metadata_json", "type": "json", "required": False},
                 {"name": "event_timestamp", "type": "number", "required": False},
+            ],
+            "indexes": [
+                "CREATE UNIQUE INDEX idx_turn_events_turn_seq ON turn_events (turn_id, seq)"
             ],
             "listRule": "",
             "viewRule": "",
@@ -213,7 +295,7 @@ def main():
         _create_if_missing(pb, col["name"], col, existing)
 
     print("\nDone. PocketBase collections are ready.")
-    print(f"Open the admin panel at {POCKETBASE_URL}/_/ to view and configure collections.")
+    print(f"Open the admin panel at {POCKETBASE_BASE_URL}/_/ to view and configure collections.")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 
 interface AutoScrollOptions {
   hasMessages: boolean;
@@ -11,132 +11,132 @@ interface AutoScrollOptions {
   lastEventCount?: number;
 }
 
-const THROTTLE_MS = 80;
-
+/** Follow layout changes until the reader intentionally leaves the live end.
+ * Observe content size, not an arbitrary post-stream timeout: markdown, images
+ * and disclosure animations can settle independently of the transport.
+ * The scroll root must retain overflow-anchor: none to avoid competing writers.
+ */
 export function useChatAutoScroll({
-  hasMessages,
-  isStreaming,
-  composerHeight,
-  messageCount,
-  lastMessageContent,
-  lastEventCount,
+  hasMessages, isStreaming, composerHeight, messageCount,
+  lastMessageContent, lastEventCount,
 }: AutoScrollOptions) {
   const containerRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const shouldAutoScrollRef = useRef(true);
-  const lastScrollTimeRef = useRef(0);
-  const pendingRafRef = useRef(0);
+  const positionRef = useRef({ top: 0, height: 0, viewport: 0 });
 
-  const scrollToBottom = useCallback((behavior: ScrollBehavior) => {
-    const container = containerRef.current;
-    if (!container) return;
-    container.scrollTo({
-      top: container.scrollHeight,
-      behavior,
-    });
+  const rememberPosition = useCallback((container: HTMLDivElement) => {
+    positionRef.current = {
+      top: container.scrollTop,
+      height: container.scrollHeight,
+      viewport: container.clientHeight,
+    };
   }, []);
 
-  useEffect(() => {
-    if (!shouldAutoScrollRef.current) return;
-
-    const now = performance.now();
-    const elapsed = now - lastScrollTimeRef.current;
-
-    if (isStreaming && elapsed < THROTTLE_MS) {
-      if (pendingRafRef.current) return;
-      pendingRafRef.current = window.setTimeout(() => {
-        pendingRafRef.current = 0;
-        if (shouldAutoScrollRef.current) {
-          scrollToBottom("instant");
-          lastScrollTimeRef.current = performance.now();
-        }
-      }, THROTTLE_MS - elapsed);
-      return () => {
-        if (pendingRafRef.current) {
-          clearTimeout(pendingRafRef.current);
-          pendingRafRef.current = 0;
-        }
-      };
-    }
-
-    const raf = window.requestAnimationFrame(() => {
-      scrollToBottom(isStreaming ? "instant" : "smooth");
-      lastScrollTimeRef.current = performance.now();
-    });
-
-    return () => {
-      window.cancelAnimationFrame(raf);
-      if (pendingRafRef.current) {
-        clearTimeout(pendingRafRef.current);
-        pendingRafRef.current = 0;
-      }
-    };
-  }, [
-    isStreaming,
-    lastEventCount,
-    lastMessageContent,
-    messageCount,
-    scrollToBottom,
-  ]);
-
-  useEffect(() => {
-    if (!hasMessages || !shouldAutoScrollRef.current) return;
-    const raf = window.requestAnimationFrame(() => {
-      scrollToBottom("instant");
-    });
-    return () => window.cancelAnimationFrame(raf);
-  }, [composerHeight, hasMessages, scrollToBottom]);
-
-  // After streaming ends, dynamically-loaded components (e.g. MathAnimatorViewer
-  // via next/dynamic) may render and grow the content height. Detect that and
-  // scroll to bottom so the user can see the full result.
-  // hasMessages is in deps so the observer attaches once the messages
-  // container mounts on session reopen — without it, the container ref is null
-  // on initial mount and the observer is never set up.
-  useEffect(() => {
-    if (isStreaming) return;
-    if (!hasMessages) return;
-
+  const pinToBottom = useCallback(() => {
     const container = containerRef.current;
     if (!container) return;
+    container.scrollTop = container.scrollHeight;
+    rememberPosition(container);
+  }, [rememberPosition]);
 
-    let prevHeight = container.scrollHeight;
-    let rafId = 0;
-
-    const check = () => {
-      if (rafId) return;
-      rafId = requestAnimationFrame(() => {
-        rafId = 0;
-        const curHeight = container.scrollHeight;
-        if (curHeight > prevHeight && shouldAutoScrollRef.current) {
-          scrollToBottom("instant");
-        }
-        prevHeight = curHeight;
-      });
-    };
-
-    const mo = new MutationObserver(check);
-    mo.observe(container, { childList: true, subtree: true });
-
-    return () => {
-      mo.disconnect();
-      if (rafId) cancelAnimationFrame(rafId);
-    };
-  }, [hasMessages, isStreaming, scrollToBottom]);
+  useLayoutEffect(() => {
+    if (hasMessages && shouldAutoScrollRef.current) pinToBottom();
+  }, [pinToBottom, hasMessages, isStreaming, messageCount,
+    lastMessageContent, lastEventCount, composerHeight]);
 
   const handleScroll = useCallback(() => {
     const container = containerRef.current;
     if (!container) return;
-    const distanceFromBottom =
-      container.scrollHeight - container.scrollTop - container.clientHeight;
-    shouldAutoScrollRef.current = distanceFromBottom < 80;
-  }, []);
+    const previous = positionRef.current;
+    // The browser clamps scrollTop when content shrinks. That is not a user
+    // gesture. Growth never moves it (overflow-anchor: none), so whatever the
+    // layout did, the position without the reader is at most the new maximum.
+    // Comparing against that keeps a scrollbar drag during streaming, when the
+    // reply grows between the drag and its scroll event, a gesture (#2072).
+    const max = Math.max(0, container.scrollHeight - container.clientHeight);
+    const expected = Math.min(previous.top, max);
+    const remaining = container.scrollHeight - container.scrollTop - container.clientHeight;
+    if (remaining < 80 && (shouldAutoScrollRef.current || container.scrollTop > expected + 4)) {
+      shouldAutoScrollRef.current = true;
+    }
+    else if (container.scrollTop < expected - 4) shouldAutoScrollRef.current = false;
+    rememberPosition(container);
+  }, [rememberPosition]);
 
-  return {
-    containerRef,
-    endRef,
-    shouldAutoScrollRef,
-    scrollToBottom,
-    handleScroll,
-  };
+  useEffect(() => {
+    if (!hasMessages) return;
+    const container = containerRef.current;
+    if (!container) return;
+    let rafId = 0;
+    const schedule = () => {
+      if (rafId) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = 0;
+        if (shouldAutoScrollRef.current) pinToBottom();
+        else rememberPosition(container);
+      });
+    };
+    // A scrollport's own box does not grow with scrollHeight. Observe its
+    // content children too: main chat has a wrapper, PartnerChat has rows.
+    const observed = new Set<Element>();
+    const resize = new ResizeObserver(schedule);
+    const observeContent = () => {
+      const targets = new Set<Element>([container, ...container.children]);
+      for (const target of observed) {
+        if (!targets.has(target)) { resize.unobserve(target); observed.delete(target); }
+      }
+      for (const target of targets) {
+        if (!observed.has(target)) { resize.observe(target); observed.add(target); }
+      }
+      schedule();
+    };
+    const mutations = new MutationObserver(observeContent);
+    mutations.observe(container, { childList: true, subtree: true });
+    container.addEventListener("load", schedule, true);
+    observeContent();
+
+    const release = () => { shouldAutoScrollRef.current = false; };
+    const onWheel = (event: WheelEvent) => { if (event.deltaY < 0) release(); };
+    let touchY = 0;
+    const onTouchStart = (event: TouchEvent) => { touchY = event.touches[0]?.clientY ?? 0; };
+    const onTouchMove = (event: TouchEvent) => {
+      const y = event.touches[0]?.clientY ?? 0;
+      if (y - touchY > 4) release();
+      touchY = y;
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest("input,textarea,[contenteditable='true']")) return;
+      if (["ArrowUp", "PageUp", "Home"].includes(event.key) || (event.key === " " && event.shiftKey)) release();
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      // Opening a trace/citation is deliberate browsing, not late model output.
+      // Sending/answering re-arms follow at the existing caller-owned boundary.
+      const target = event.target;
+      if (target instanceof Element && target.closest("button,a,summary,[role='button']")) release();
+    };
+    container.addEventListener("wheel", onWheel, { passive: true });
+    container.addEventListener("touchstart", onTouchStart, { passive: true });
+    container.addEventListener("touchmove", onTouchMove, { passive: true });
+    container.addEventListener("keydown", onKeyDown);
+    container.addEventListener("pointerdown", onPointerDown, true);
+    return () => {
+      resize.disconnect(); mutations.disconnect();
+      container.removeEventListener("load", schedule, true);
+      container.removeEventListener("wheel", onWheel);
+      container.removeEventListener("touchstart", onTouchStart);
+      container.removeEventListener("touchmove", onTouchMove);
+      container.removeEventListener("keydown", onKeyDown);
+      container.removeEventListener("pointerdown", onPointerDown, true);
+      if (rafId) cancelAnimationFrame(rafId);
+    };
+  }, [hasMessages, pinToBottom, rememberPosition]);
+
+  const scrollToBottom = useCallback((_behavior: ScrollBehavior) => {
+    void _behavior;
+    pinToBottom();
+  }, [pinToBottom]);
+
+  return { containerRef, endRef, shouldAutoScrollRef, scrollToBottom, handleScroll };
 }

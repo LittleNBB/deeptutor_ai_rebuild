@@ -1,156 +1,81 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useEffect, useState, type MouseEventHandler } from "react";
 import { useTranslation } from "react-i18next";
+import Tooltip from "@/shared/ui/Tooltip";
+
 import {
-  normalizeVersionTag,
-  parseBuild,
-  type ParsedBuild,
-} from "@/lib/version";
-
-interface LatestVersionPayload {
-  tag: string | null;
-  name: string | null;
-  url: string | null;
-  publishedAt: string | null;
-  source: "github" | "fallback";
-}
-
-interface CurrentVersionPayload extends ParsedBuild {
-  source: "git" | "env" | "unknown";
-  detectedAt: string;
-}
-
-interface VersionPayload extends LatestVersionPayload {
-  current?: CurrentVersionPayload;
-  latest?: LatestVersionPayload;
-}
+  fetchAppUpdateStatus,
+  subscribeAppUpdateStatus,
+  type AppUpdateStatus,
+} from "@/lib/app-update";
 
 interface VersionBadgeProps {
-  /** Render the compact variant for the collapsed sidebar (currently hidden). */
-  collapsed?: boolean;
+  onNavigate?: MouseEventHandler<HTMLAnchorElement>;
 }
 
-let _cache: VersionPayload | null = null;
-let _cacheAt = 0;
-let _inflight: Promise<VersionPayload | null> | null = null;
-const CACHE_TTL_MS = 60_000;
-
-async function loadVersion(): Promise<VersionPayload | null> {
-  if (_cache && Date.now() - _cacheAt < CACHE_TTL_MS) return _cache;
-  if (_inflight) return _inflight;
-  _inflight = (async () => {
-    try {
-      const res = await fetch("/api/version", { cache: "no-store" });
-      if (!res.ok) return null;
-      const data = (await res.json()) as VersionPayload;
-      _cache = data;
-      _cacheAt = Date.now();
-      return data;
-    } catch {
-      return null;
-    } finally {
-      _inflight = null;
-    }
-  })();
-  return _inflight;
-}
-
-type Status = "latest" | "outdated" | "dev" | "unknown";
-
-export function VersionBadge({ collapsed = false }: VersionBadgeProps) {
+export function VersionBadge({ onNavigate }: VersionBadgeProps) {
   const { t } = useTranslation();
-  const [data, setData] = useState<VersionPayload | null>(_cache);
+  const [status, setStatus] = useState<AppUpdateStatus | null>(null);
+  const [error, setError] = useState("");
 
   useEffect(() => {
-    let cancelled = false;
-    const refresh = () => {
-      loadVersion().then((v) => {
-        if (!cancelled) setData(v);
-      });
-    };
-    refresh();
-    const interval = window.setInterval(refresh, CACHE_TTL_MS);
+    let active = true;
+    const controller = new AbortController();
+    const unsubscribe = subscribeAppUpdateStatus((signal) => {
+      if (!active) return;
+      if (signal.status) setStatus(signal.status);
+      setError(signal.error);
+    });
+
+    void fetchAppUpdateStatus(controller.signal).catch((cause) => {
+      if (!active || controller.signal.aborted) return;
+      setError(
+        cause instanceof Error ? cause.message : "Unable to check for updates",
+      );
+    });
+
     return () => {
-      cancelled = true;
-      window.clearInterval(interval);
+      active = false;
+      controller.abort();
+      unsubscribe();
     };
   }, []);
 
-  const fallbackBuild = parseBuild(process.env.NEXT_PUBLIC_APP_VERSION || "");
-  const build = data?.current?.raw ? data.current : fallbackBuild;
-  const latest = data?.latest ?? data;
-  const latestNorm = normalizeVersionTag(latest?.tag);
-
-  const { status, displayTag, href, tooltip } = useMemo(() => {
-    let status: Status = "unknown";
-    if (build?.tag && latestNorm) {
-      status =
-        build.tag === latestNorm
-          ? build.isDev
-            ? "dev"
-            : "latest"
-          : "outdated";
-    } else if (build?.isDev) {
-      status = "dev";
-    }
-
-    // Display: prefer the running build (most accurate), fall back to the
-    // latest GitHub release as an informational placeholder.
-    const displayTag = build?.display ?? latestNorm ?? null;
-
-    const href =
-      latest?.url ??
-      (latestNorm
-        ? `https://github.com/HKUDS/DeepTutor/releases/tag/${latestNorm}`
-        : "https://github.com/HKUDS/DeepTutor/releases");
-
-    let tooltip: string;
-    if (status === "latest" && displayTag) {
-      tooltip = `${displayTag} · ${t("Up to date")}`;
-    } else if (status === "outdated" && displayTag && latestNorm) {
-      tooltip = `${displayTag} · ${t("Update available")}: ${latestNorm}`;
-    } else if (status === "dev") {
-      const base = `${t("Development build")}: ${build?.raw ?? ""}`;
-      tooltip = latestNorm
-        ? `${base} · ${t("Latest release")}: ${latestNorm}`
-        : base;
-    } else if (displayTag) {
-      tooltip = `${t("Latest release")}: ${displayTag}`;
-    } else {
-      tooltip = t("Loading...");
-    }
-
-    return { status, displayTag, href, tooltip };
-  }, [build, latestNorm, latest?.url, t]);
-
-  // Keep the collapsed sidebar entirely free of version chrome.
-  if (collapsed) return null;
-
-  const dotClass =
-    status === "latest"
-      ? "bg-emerald-500/45"
-      : status === "outdated"
-        ? "bg-amber-500/55"
-        : status === "dev"
-          ? "bg-sky-500/45"
-          : "bg-[var(--muted-foreground)]/25";
+  const state = error
+    ? { dot: "bg-red-500", label: t("Status check failed") }
+    : status?.update_available
+      ? { dot: "bg-amber-500", label: t("Update available") }
+      : status?.release
+        ? {
+            dot: "bg-[color-mix(in_srgb,var(--muted-foreground)_35%,transparent)]",
+            label: t("Up to date"),
+          }
+        : status && !status.check_enabled
+          ? {
+              dot: "bg-[color-mix(in_srgb,var(--muted-foreground)_35%,transparent)]",
+              label: t("Version checks are disabled."),
+            }
+          : {
+              dot: "bg-[color-mix(in_srgb,var(--muted-foreground)_35%,transparent)]",
+              label: status ? t("Not checked yet") : t("Checking..."),
+            };
 
   return (
-    <a
-      href={href}
-      target="_blank"
-      rel="noreferrer noopener"
-      title={tooltip}
-      className="group/ver flex min-w-0 flex-1 items-center gap-2 rounded-lg px-3 py-1.5 text-[11px] font-mono tabular-nums tracking-tight text-[var(--muted-foreground)]/55 transition-colors hover:bg-[var(--background)]/50 hover:text-[var(--muted-foreground)]"
-    >
-      <span
-        className={`h-1.5 w-1.5 shrink-0 rounded-full transition-colors ${dotClass}`}
-        aria-hidden="true"
-      />
-      <span className="truncate leading-none decoration-[var(--muted-foreground)]/40 decoration-dotted underline-offset-[3px] group-hover/ver:underline">
-        {displayTag ?? "—"}
-      </span>
-    </a>
+    <Tooltip label={state.label as string} side="right">
+      <Link
+        href="/settings/about"
+        prefetch={false}
+        onClick={onNavigate}
+        aria-label={state.label as string}
+        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-[var(--muted-foreground)] transition-colors hover:bg-background/50 hover:text-[var(--foreground)]"
+      >
+        <span
+          aria-hidden="true"
+          className={`h-1.5 w-1.5 rounded-full transition-colors ${state.dot}`}
+        />
+      </Link>
+    </Tooltip>
   );
 }

@@ -7,24 +7,31 @@ Combines user directory initialization and port configuration management.
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import yaml
 
-from deeptutor.services.config import get_env_store
+from deeptutor.services.config.loader import (
+    DEFAULT_EXPLORE_CONTEXT_PARAMS,
+    DEFAULT_QUESTION_PARAMS,
+    DEFAULT_RESEARCH_PARAMS,
+)
 from deeptutor.services.path_service import get_path_service
 
 # Initialize logger for setup operations
 _setup_logger = None
 
 DEFAULT_INTERFACE_SETTINGS = {
-    "theme": "light",
+    # "system" follows the OS. "snow" remains the pure-white Default palette.
+    "theme": "system",
     "language": "en",
     "sidebar_description": "✨ Data Intelligence Lab @ HKU",
     "sidebar_nav_order": {
-        "start": ["/", "/history", "/knowledge", "/notebook"],
+        "start": ["/", "/history", "/knowledge-bases", "/notebooks"],
         "learnResearch": ["/question", "/solver", "/research", "/co_writer"],
     },
 }
+
 
 DEFAULT_MAIN_SETTINGS = {
     "system": {
@@ -35,17 +42,8 @@ DEFAULT_MAIN_SETTINGS = {
         "save_to_file": True,
         "console_output": True,
     },
-    "personalization": {
-        "auto_update": True,
-        "max_react_rounds": 6,
-        "agents": {
-            "reflection": True,
-            "summary": True,
-            "weakness": True,
-        },
-    },
     "tools": {
-        "run_code": {
+        "exec": {
             "allowed_roots": ["./data/user"],
         },
         "web_search": {
@@ -53,19 +51,9 @@ DEFAULT_MAIN_SETTINGS = {
         },
     },
     "capabilities": {
-        "question": {
-            "max_parallel_questions": 1,
-            "idea_loop": {"max_rounds": 3, "ideas_per_round": 5},
-            "generation": {"max_retries": 2},
-        },
         "solve": {
-            "max_react_iterations": 10,
-            "max_plan_steps": 10,
+            "max_rounds": 12,
             "max_replans": 2,
-            "observation_max_tokens": 2000,
-            "enable_citations": True,
-            "save_intermediate_results": True,
-            "detailed_answer": True,
         },
         "research": {
             "researching": {
@@ -75,23 +63,37 @@ DEFAULT_MAIN_SETTINGS = {
                 "paper_search_years_limit": 3,
             },
         },
+        "question": {
+            "exploring": {
+                "max_iterations": 8,
+                "tool_summarizer": {
+                    "enabled": True,
+                    "max_tokens": 800,
+                },
+            },
+        },
     },
 }
 
-DEFAULT_AGENTS_SETTINGS = {
+DEFAULT_AGENTS_SETTINGS: dict[str, Any] = {
     "capabilities": {
         "solve": {"temperature": 0.3, "max_tokens": 8192},
         "research": {"temperature": 0.5, "max_tokens": 12000},
         "question": {"temperature": 0.7, "max_tokens": 4096},
         "co_writer": {"temperature": 0.7, "max_tokens": 4096},
+        "visualize": {"temperature": 0.15, "max_tokens": 16000},
+        # A book spine is one JSON payload holding a concept graph plus every
+        # chapter, and a reasoning model pays for its hidden tokens out of the
+        # same budget. 4096 (the old, unreachable global fallback) truncated
+        # both (#1316). Matched to `research` rather than pushed higher: the
+        # same "long structured output" shape, the same accepted risk against
+        # providers that cap `max_tokens`, and the low-effort retry in
+        # `services/llm/structured_retry.py` is what actually rescues a starved
+        # round.
+        "book": {"temperature": 0.5, "max_tokens": 12000},
         "chat": {
             "temperature": 0.2,
             "responding": {"max_tokens": 8000},
-            "answer_now": {"max_tokens": 8000},
-            "thinking": {"max_tokens": 2000},
-            "observing": {"max_tokens": 2000},
-            "acting": {"max_tokens": 2000},
-            "react_fallback": {"max_tokens": 1500},
         },
     },
     "tools": {
@@ -103,8 +105,30 @@ DEFAULT_AGENTS_SETTINGS = {
     "plugins": {
         "vision_solver": {"temperature": 0.3, "max_tokens": 12000},
         "math_animator": {"temperature": 0.4, "max_tokens": 12000},
+        # A whole Remotion lesson in one reply, plus a reasoning model's thinking.
+        "video_lesson": {"temperature": 0.5, "max_tokens": 48000},
+    },
+    # Settings' "test this model" probe. A reasoning model spends its budget
+    # thinking before it answers, so the 1024 that sufficed for a chat model
+    # returned an empty completion and the probe reported the model broken.
+    "diagnostics": {
+        "llm_probe": {"temperature": 0.1, "max_tokens": 4096},
     },
 }
+
+# Per-stage budgets are seeded from the same tables the pipelines read, so a
+# fresh agents.yaml shows every knob that governs a run and Settings can edit
+# it. Derived rather than copied: two lists of the same numbers is how a
+# default and its seed drift apart, which is the shape of #1316.
+for _capability, _stages in (
+    ("question", DEFAULT_QUESTION_PARAMS),
+    ("research", DEFAULT_RESEARCH_PARAMS),
+    ("explore_context", DEFAULT_EXPLORE_CONTEXT_PARAMS),
+):
+    _section = DEFAULT_AGENTS_SETTINGS["capabilities"].setdefault(_capability, {})
+    for _stage, _values in _stages.items():
+        _section.setdefault(_stage, dict(_values))
+del _capability, _stages, _section, _stage, _values
 
 
 def _get_setup_logger():
@@ -149,7 +173,7 @@ def init_user_directories(project_root: Path | None = None) -> None:
             ├── deep_question/
             ├── deep_research/
             ├── math_animator/
-            └── _detached_code_execution/
+            └── _detached_exec/
 
     Args:
         project_root: Project root directory (ignored, kept for API compatibility)
@@ -178,6 +202,35 @@ def _ensure_essential_settings(path_service) -> None:
 
     agents_file = path_service.get_runtime_config_file("agents")
     _write_yaml_if_missing(agents_file, DEFAULT_AGENTS_SETTINGS)
+
+    try:
+        from deeptutor.services.config import ensure_runtime_settings_files
+
+        ensure_runtime_settings_files()
+    except Exception as e:
+        _get_setup_logger().warning(f"Failed to initialise runtime JSON settings: {e}")
+
+    _seed_default_personas()
+
+
+def _seed_default_personas() -> None:
+    """Seed the bundled persona presets into the admin workspace on first run.
+
+    Fresh installs otherwise show an empty Persona list even though the docs
+    advertise peer / teacher / research-assistant presets (issue #659). Seeding
+    the admin workspace surfaces them as read-only presets for every user.
+    Best-effort — never blocks startup.
+    """
+    try:
+        from deeptutor.multi_user.paths import get_admin_path_service
+        from deeptutor.services.persona.service import PersonaService
+
+        admin_personas = get_admin_path_service().get_workspace_dir() / "personas"
+        seeded = PersonaService(root=admin_personas).seed_presets()
+        if seeded:
+            _get_setup_logger().info(f"Seeded default personas: {', '.join(seeded)}")
+    except Exception as e:
+        _get_setup_logger().warning(f"Failed to seed default personas: {e}")
 
 
 def _write_json_if_missing(file_path: Path, payload: dict) -> None:
@@ -209,18 +262,13 @@ def _write_yaml_if_missing(file_path: Path, payload: dict) -> None:
 # ============================================================================
 # Port Configuration Management
 # ============================================================================
-# Ports are configured via environment variables in the project .env file:
-#   BACKEND_PORT=8001   (default: 8001)
-#   FRONTEND_PORT=3782  (default: 3782)
+# Ports are configured via data/user/settings/system.json.
 # ============================================================================
 
 
 def get_backend_port(project_root: Path | None = None) -> int:
     """
-    Get backend port from .env, falling back to environment/defaults.
-
-    Preferred source: .env -> BACKEND_PORT
-    Fallback source: process environment -> BACKEND_PORT
+    Get backend port from runtime settings.
 
     Returns:
         Backend port number (default: 8001)
@@ -229,25 +277,15 @@ def get_backend_port(project_root: Path | None = None) -> int:
         from deeptutor.services.config.launch_settings import load_launch_settings
 
         return load_launch_settings(project_root).backend_port
-    except Exception:
-        # Preserve the historical .env fallback if runtime settings cannot load.
-        pass
-
-    env_port = get_env_store().get("BACKEND_PORT", "8001")
-    try:
-        return int(env_port)
-    except ValueError:
+    except Exception as exc:
         logger = _get_setup_logger()
-        logger.warning(f"Invalid BACKEND_PORT: {env_port}, using default 8001")
+        logger.warning(f"Failed to load backend port from runtime settings: {exc}")
         return 8001
 
 
 def get_frontend_port(project_root: Path | None = None) -> int:
     """
-    Get frontend port from .env, falling back to environment/defaults.
-
-    Preferred source: .env -> FRONTEND_PORT
-    Fallback source: process environment -> FRONTEND_PORT
+    Get frontend port from runtime settings.
 
     Returns:
         Frontend port number (default: 3782)
@@ -256,16 +294,9 @@ def get_frontend_port(project_root: Path | None = None) -> int:
         from deeptutor.services.config.launch_settings import load_launch_settings
 
         return load_launch_settings(project_root).frontend_port
-    except Exception:
-        # Preserve the historical .env fallback if runtime settings cannot load.
-        pass
-
-    env_port = get_env_store().get("FRONTEND_PORT", "3782")
-    try:
-        return int(env_port)
-    except ValueError:
+    except Exception as exc:
         logger = _get_setup_logger()
-        logger.warning(f"Invalid FRONTEND_PORT: {env_port}, using default 3782")
+        logger.warning(f"Failed to load frontend port from runtime settings: {exc}")
         return 3782
 
 
@@ -290,7 +321,7 @@ def get_ports(project_root: Path | None = None) -> tuple[int, int]:
 __all__ = [
     # User directory initialization
     "init_user_directories",
-    # Port configuration (from .env)
+    # Port configuration
     "get_backend_port",
     "get_frontend_port",
     "get_ports",

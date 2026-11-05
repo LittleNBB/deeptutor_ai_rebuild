@@ -5,6 +5,8 @@ from typing import Any, Dict
 
 import httpx
 
+from deeptutor.services.llm.openai_http_client import disable_ssl_verify_enabled
+
 from .base import BaseEmbeddingAdapter, EmbeddingRequest, EmbeddingResponse
 
 logger = logging.getLogger(__name__)
@@ -13,31 +15,40 @@ logger = logging.getLogger(__name__)
 class CohereEmbeddingAdapter(BaseEmbeddingAdapter):
     """Adapter for Cohere Embed API (v1 and v2)."""
 
+    # Cohere requires input_type and already defaults to "search_document",
+    # so document vectors are unchanged and only queries gain the right role.
+    SUPPORTS_INPUT_TYPE = True
+
     MODELS_INFO = {
         "embed-v4.0": {
             "dimensions": [256, 512, 1024, 1536],
             "default": 1024,
             "api_version": "v2",
+            "multimodal": True,
         },
         "embed-english-v3.0": {
             "dimensions": [1024],
             "default": 1024,
             "api_version": "v1",
+            "multimodal": False,
         },
         "embed-multilingual-v3.0": {
             "dimensions": [1024],
             "default": 1024,
             "api_version": "v1",
+            "multimodal": False,
         },
         "embed-multilingual-light-v3.0": {
             "dimensions": [384],
             "default": 384,
             "api_version": "v1",
+            "multimodal": False,
         },
         "embed-english-light-v3.0": {
             "dimensions": [384],
             "default": 384,
             "api_version": "v1",
+            "multimodal": False,
         },
     }
 
@@ -73,6 +84,10 @@ class CohereEmbeddingAdapter(BaseEmbeddingAdapter):
             if not request.truncate:
                 payload["truncate"] = "NONE"
         else:
+            if request.contents and not bool(model_info.get("multimodal", False)):
+                raise ValueError(
+                    f"Cohere model '{model_name}' does not support multimodal `contents`."
+                )
             payload = {
                 "model": model_name,
                 "embedding_types": ["float"],
@@ -112,7 +127,9 @@ class CohereEmbeddingAdapter(BaseEmbeddingAdapter):
 
         logger.debug(f"Sending embedding request to {url} with {len(request.texts)} texts")
 
-        async with httpx.AsyncClient(timeout=self.request_timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=self.request_timeout, verify=not disable_ssl_verify_enabled()
+        ) as client:
             response = await client.post(url, json=payload, headers=headers)
 
             if response.status_code >= 400:
@@ -147,11 +164,13 @@ class CohereEmbeddingAdapter(BaseEmbeddingAdapter):
     def get_model_info(self) -> Dict[str, Any]:
         model_info = self.MODELS_INFO.get(self.model, {})
         dimensions_list = model_info.get("dimensions", [])
+        api_version = self.api_version or model_info.get("api_version") or "v2"
         return {
             "model": self.model,
             "dimensions": model_info.get("default", self.dimensions),
             "supports_variable_dimensions": len(dimensions_list) > 1
             if isinstance(dimensions_list, list)
             else False,
+            "multimodal": bool(model_info.get("multimodal", False)) and api_version != "v1",
             "provider": "cohere",
         }

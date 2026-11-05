@@ -5,10 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from deeptutor.capabilities.math_animator import MathAnimatorCapability
+from deeptutor.agents.math_animator.capability import MathAnimatorCapability
 from deeptutor.core.context import UnifiedContext
 from deeptutor.core.stream import StreamEvent, StreamEventType
-from deeptutor.core.stream_bus import StreamBus
+from deeptutor.runtime.stream_bus import StreamBus
 
 
 async def _collect_events(run_coro) -> list[StreamEvent]:
@@ -34,7 +34,7 @@ async def test_math_animator_capability_emits_summary_and_result(
 ) -> None:
     # Unit test should not require real optional dependency installation.
     monkeypatch.setattr(
-        "deeptutor.capabilities.math_animator.importlib.util.find_spec",
+        "deeptutor.agents.math_animator.capability.importlib.util.find_spec",
         lambda name: object() if name == "manim" else None,
     )
 
@@ -61,7 +61,7 @@ async def test_math_animator_capability_emits_summary_and_result(
                         SimpleNamespace(
                             model_dump=lambda: {
                                 "type": "video",
-                                "url": "/api/outputs/agent/math_animator/turn_1/artifacts/video.mp4",
+                                "url": "/files/outputs/agent/math_animator/turn_1/artifacts/video.mp4",
                                 "filename": "video.mp4",
                                 "content_type": "video/mp4",
                                 "label": "Animation video",

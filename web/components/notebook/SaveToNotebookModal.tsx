@@ -1,29 +1,33 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
   Loader2,
   MessageSquare,
   NotebookPen,
+  Plus,
   Sparkles,
   User,
-  X,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { apiUrl } from "@/lib/api";
+import PickerShell from "@/components/common/PickerShell";
+import PickerHeader from "@/components/common/PickerHeader";
+import { apiFetch, apiUrl } from "@/lib/api";
 import {
+  createNotebook,
   listNotebooks,
   type NotebookSummary as RealNotebookSummary,
 } from "@/lib/notebook-api";
 
+const AddToNote = dynamic(
+  () => import("@/features/notes/components/AddToNote"),
+  { ssr: false },
+);
+
 type RecordType =
-  | "solve"
-  | "question"
-  | "research"
-  | "chat"
-  | "co_writer"
-  | "tutorbot";
+  "solve" | "question" | "research" | "chat" | "co_writer" | "tutorbot";
 
 export interface NotebookSavePayload {
   recordType: RecordType;
@@ -161,9 +165,21 @@ export default function SaveToNotebookModal({
   const [selectedMessageIdx, setSelectedMessageIdx] = useState<Set<number>>(
     new Set(),
   );
+  // Creating a notebook without leaving the dialog: having to go find the
+  // Notebooks page mid-save was the single most-reported friction here.
+  const [newNotebookName, setNewNotebookName] = useState("");
+  const [isCreatingNotebook, setIsCreatingNotebook] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
   const hasMessageSelection = Array.isArray(messages) && messages.length > 0;
+
+  useEffect(() => {
+    if (!open) setIsLoading(false);
+    return () => {
+      abortRef.current?.abort();
+      abortRef.current = null;
+    };
+  }, [open]);
 
   useEffect(() => {
     if (!open) {
@@ -174,6 +190,7 @@ export default function SaveToNotebookModal({
     setError("");
     setSelectedIds([]);
     setTitleEdited(false);
+    setNewNotebookName("");
     if (hasMessageSelection && messages) {
       setSelectedMessageIdx(new Set(messages.map((_, idx) => idx)));
       setTitle(deriveTitle(messages, payload?.title || ""));
@@ -185,7 +202,9 @@ export default function SaveToNotebookModal({
     void (async () => {
       try {
         const list = await listNotebooks();
-        setNotebooks(list);
+        // Damaged notebooks cannot accept a record — the backend skips them
+        // — so they are not offered as a destination.
+        setNotebooks(list.filter((notebook) => !notebook.unreadable));
       } catch {
         setNotebooks([]);
       } finally {
@@ -193,6 +212,24 @@ export default function SaveToNotebookModal({
       }
     })();
   }, [open, payload, messages, hasMessageSelection]);
+
+  const handleCreateNotebook = async () => {
+    const name = newNotebookName.trim();
+    if (!name || isCreatingNotebook) return;
+    setIsCreatingNotebook(true);
+    setError("");
+    try {
+      const created = await createNotebook({ name });
+      setNotebooks((prev) => [created, ...prev]);
+      // Pre-select it: the user made this notebook in order to save here.
+      setSelectedIds([created.id]);
+      setNewNotebookName("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsCreatingNotebook(false);
+    }
+  };
 
   const orderedSelectedMessages = useMemo<NotebookSaveMessage[]>(() => {
     if (!hasMessageSelection || !messages) return [];
@@ -301,8 +338,8 @@ export default function SaveToNotebookModal({
     }
 
     try {
-      const response = await fetch(
-        apiUrl("/api/v1/notebook/add_record_with_summary"),
+      const response = await apiFetch(
+        apiUrl("/api/notebooks/actions/add-record-with-summary"),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -319,8 +356,9 @@ export default function SaveToNotebookModal({
         },
       );
 
+      if (controller.signal.aborted) return;
       if (!response.ok || !response.body) {
-        throw new Error("Failed to save to notebook.");
+        throw new Error(t("Failed to save to notebook."));
       }
 
       const reader = response.body.getReader();
@@ -330,6 +368,7 @@ export default function SaveToNotebookModal({
 
       while (true) {
         const { done, value } = await reader.read();
+        if (controller.signal.aborted) return;
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         const lastSeparator = buffer.lastIndexOf("\n\n");
@@ -346,30 +385,58 @@ export default function SaveToNotebookModal({
             setSummaryPreview(finalSummary);
           } else if (type === "error") {
             throw new Error(
-              String(event.payload.detail || "Failed to save to notebook."),
+              String(event.payload.detail || t("Failed to save to notebook.")),
             );
           } else if (type === "result") {
+            // The backend skips notebooks it cannot write to and still
+            // returns a record, so success has to be judged by which
+            // notebooks actually accepted it — not by the response arriving.
+            const accepted = Array.isArray(event.payload.added_to_notebooks)
+              ? (event.payload.added_to_notebooks as string[])
+              : [];
+            const rejected = selectedIds.filter((id) => !accepted.includes(id));
+            if (!accepted.length) {
+              throw new Error(
+                t(
+                  "No notebook accepted this save. Their files may be missing or damaged.",
+                ),
+              );
+            }
             const summary = String(event.payload.summary || finalSummary);
             setSummaryPreview(summary);
+            if (rejected.length) {
+              // Partial success: the save happened, but say what missed.
+              const names = rejected
+                .map((id) => notebooks.find((n) => n.id === id)?.name ?? id)
+                .join("、");
+              setError(t("Could not save to: {{names}}", { names }));
+            }
             onSaved?.({ summary });
             setIsLoading(false);
-            onClose();
+            if (!rejected.length) onClose();
             return;
           }
         }
       }
 
-      throw new Error("Notebook save stream ended unexpectedly.");
+      throw new Error(t("Notebook save stream ended unexpectedly."));
     } catch (err) {
       if (controller.signal.aborted) return;
       setError(
-        err instanceof Error ? err.message : "Failed to save to notebook.",
+        err instanceof Error ? err.message : t("Failed to save to notebook."),
       );
       setIsLoading(false);
+    } finally {
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setIsLoading(false);
+      }
     }
   };
 
-  if (!open || !payload) return null;
+  // payload may be null while the parent is preparing the save context.
+  // Treat that as "not open" so the shell never renders without content.
+  const isOpen = open && !!payload;
 
   const totalMessages = messages?.length ?? 0;
   const selectedMessageCount = selectedMessageIdx.size;
@@ -377,34 +444,46 @@ export default function SaveToNotebookModal({
     totalMessages > 0 && selectedMessageCount === totalMessages;
 
   return (
-    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-[var(--background)]/65 p-4 backdrop-blur-md">
+    <PickerShell
+      open={isOpen}
+      onClose={onClose}
+      labelledBy="save-to-notebook-title"
+      zIndex={80}
+      className="p-4 backdrop-blur-md"
+      backdropClass="bg-[var(--background)]/65"
+    >
       <div className="surface-card flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--card)] text-[var(--card-foreground)] shadow-[0_22px_70px_rgba(0,0,0,0.18)]">
-        <div className="flex items-start justify-between gap-3 border-b border-[var(--border)] px-5 py-4">
-          <div className="min-w-0">
-            <div className="mb-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--primary)]">
-              {t("Notebook Output")}
-            </div>
-            <h2 className="text-lg font-semibold text-[var(--foreground)]">
-              {t("Save to Notebook")}
-            </h2>
-            <p className="mt-0.5 text-sm text-[var(--muted-foreground)]">
-              {hasMessageSelection
-                ? t(
-                    "Choose which messages to include, pick one or more notebooks, and a summary will be generated automatically.",
-                  )
-                : t(
-                    "Select one or more notebooks. A summary will be generated automatically.",
-                  )}
-            </p>
-          </div>
-          <button
-            onClick={onClose}
-            className="rounded-lg p-2 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
-            aria-label={t("Close")}
-          >
-            <X className="h-4 w-4" />
-          </button>
-        </div>
+        <PickerHeader
+          icon={NotebookPen}
+          titleId="save-to-notebook-title"
+          title={t("Save to Notebook")}
+          subtitle={
+            hasMessageSelection
+              ? t(
+                  "Choose which messages to include, pick one or more notebooks, and a summary will be generated automatically.",
+                )
+              : t(
+                  "Select one or more notebooks. A summary will be generated automatically.",
+                )
+          }
+          onClose={onClose}
+        />
+
+        <AddToNote
+          title={title}
+          markdown={effectiveOutput}
+          sourceId={String(
+            payload?.metadata?.session_id ||
+              payload?.metadata?.material_id ||
+              "",
+          )}
+          sourceUrl={String(
+            payload?.metadata?.source_url ||
+              (payload?.metadata?.session_id
+                ? `/chat/${encodeURIComponent(String(payload.metadata.session_id))}`
+                : ""),
+          )}
+        />
 
         <div className="flex-1 space-y-5 overflow-y-auto bg-[var(--background)]/40 px-5 py-5">
           <div>
@@ -540,12 +619,9 @@ export default function SaveToNotebookModal({
                   <Loader2 className="h-4 w-4 animate-spin text-[var(--muted-foreground)]" />
                 </div>
               ) : notebooks.length === 0 ? (
-                <div className="flex flex-col items-center gap-2 px-3 py-6 text-center text-sm text-[var(--muted-foreground)]">
+                <div className="flex flex-col items-center gap-2.5 px-3 py-6 text-center text-sm text-[var(--muted-foreground)]">
                   <NotebookPen className="h-5 w-5 text-[var(--muted-foreground)]/60" />
-                  <span>{t("No notebooks found.")}</span>
-                  <span className="text-[11px] text-[var(--muted-foreground)]/80">
-                    {t("Create one from the Knowledge → Notebooks page.")}
-                  </span>
+                  <span>{t("No notebooks yet.")}</span>
                 </div>
               ) : (
                 notebooks.map((notebook) => {
@@ -553,6 +629,7 @@ export default function SaveToNotebookModal({
                   return (
                     <button
                       key={notebook.id}
+                      aria-pressed={selected}
                       onClick={() => toggleNotebook(notebook.id)}
                       className={`flex w-full items-start gap-3 rounded-lg border px-3 py-2.5 text-left transition ${
                         selected
@@ -596,6 +673,33 @@ export default function SaveToNotebookModal({
                 })
               )}
             </div>
+            {!isLoadingNotebooks && (
+              <div className="mt-2 flex items-center gap-2">
+                <input
+                  value={newNotebookName}
+                  onChange={(event) => setNewNotebookName(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") void handleCreateNotebook();
+                  }}
+                  placeholder={t("New notebook")}
+                  aria-label={t("New notebook")}
+                  className="flex-1 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2.5 py-1.5 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--primary)]/50"
+                />
+                <button
+                  type="button"
+                  onClick={() => void handleCreateNotebook()}
+                  disabled={!newNotebookName.trim() || isCreatingNotebook}
+                  className="inline-flex items-center gap-1 rounded-lg bg-[var(--primary)] px-2.5 py-1.5 text-[12.5px] font-medium text-[var(--primary-foreground)] disabled:opacity-40"
+                >
+                  {isCreatingNotebook ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Plus className="h-3.5 w-3.5" />
+                  )}
+                  {t("Create")}
+                </button>
+              </div>
+            )}
           </div>
 
           <div>
@@ -635,6 +739,6 @@ export default function SaveToNotebookModal({
           </button>
         </div>
       </div>
-    </div>
+    </PickerShell>
   );
 }

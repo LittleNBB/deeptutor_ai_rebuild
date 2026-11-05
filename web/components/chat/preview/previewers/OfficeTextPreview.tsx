@@ -1,27 +1,45 @@
 "use client";
 
-import { Info } from "lucide-react";
+import { Info, Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import FallbackPreview from "./FallbackPreview";
+import { useTextSource } from "./useTextSource";
 
 /**
- * DOCX / XLSX / PPTX preview using the backend-extracted plain text. Browsers
- * cannot natively render OOXML and we choose not to ship mammoth.js / sheetjs
- * to keep the bundle slim. Showing the extracted text doubles as "see what
- * the LLM read", which is itself useful in a study tool.
+ * Fallback for PowerPoint and legacy Office files when PDF conversion is
+ * unavailable. Showing extracted text also reveals what the assistant read.
  */
 export default function OfficeTextPreview({
   filename,
   extractedText,
+  extractedTextUrl,
   url,
 }: {
   filename: string;
   extractedText: string | undefined;
+  extractedTextUrl?: string | null;
   url: string | null;
 }) {
   const { t } = useTranslation();
+  const state = useTextSource(
+    extractedText ? null : extractedTextUrl || null,
+    extractedText,
+  );
 
-  if (!extractedText) {
+  if (!extractedText && !extractedTextUrl) {
+    return <FallbackPreview filename={filename} url={url} />;
+  }
+
+  if (state.kind === "loading") {
+    return (
+      <div className="flex h-full items-center justify-center gap-2 text-[12px] text-[var(--muted-foreground)]">
+        <Loader2 size={14} className="animate-spin" />
+        <span>{t("Loading preview…")}</span>
+      </div>
+    );
+  }
+
+  if (state.kind === "error") {
     return <FallbackPreview filename={filename} url={url} />;
   }
 
@@ -37,7 +55,7 @@ export default function OfficeTextPreview({
       </div>
       <div className="flex-1 overflow-y-auto px-6 py-5">
         <pre className="whitespace-pre-wrap break-words font-sans text-[13px] leading-relaxed text-[var(--foreground)]">
-          {extractedText}
+          {state.text}
         </pre>
       </div>
     </div>

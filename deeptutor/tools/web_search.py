@@ -13,17 +13,13 @@ Usage:
     # With provider
     result = web_search("What is AI?", provider="tavily")
 
-Environment Variables:
-    - SEARCH_PROVIDER: Default search provider (default: brave)
-    - SEARCH_API_KEY: Unified API key for all providers
+Configuration:
+    Search profiles live in data/user/settings/model_catalog.json.
 
 Available Providers:
-    - brave: Brave web search API
-    - tavily: Research-focused with optional answers
-    - jina: SERP with full content extraction
-    - searxng: Self-hosted SearXNG endpoint
-    - duckduckgo: Zero-config search
-    - perplexity: AI-powered search with answers
+    Defined once in ``SEARCH_PROVIDERS``
+    (``deeptutor/services/config/provider_runtime.py``); call
+    ``get_providers_info()`` for the live list with its credential requirements.
 """
 
 # Re-export from services layer

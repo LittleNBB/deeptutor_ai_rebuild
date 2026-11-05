@@ -9,7 +9,8 @@ from typing import Any
 
 import yaml
 
-from deeptutor.services.config import PROJECT_ROOT, parse_language
+from deeptutor.runtime.home import PACKAGE_ROOT
+from deeptutor.services.config import parse_language
 
 
 class PromptManager:
@@ -31,6 +32,7 @@ class PromptManager:
         "question",
         "co_writer",
         "math_animator",
+        "video_lesson",
         "book",
         "notebook",
         "visualize",
@@ -42,6 +44,11 @@ class PromptManager:
     NON_AGENT_MODULES: dict[str, str] = {
         "book": "book",
         "co_writer": "co_writer",
+        "capabilities": "capabilities",
+        # A capability that owns a whole loop keeps its prompt pack beside its
+        # code rather than under agents/, so the pack and the tools it
+        # describes are read and reviewed together.
+        "mastery": "capabilities/mastery",
     }
 
     def __new__(cls) -> "PromptManager":
@@ -75,7 +82,11 @@ class PromptManager:
             return self._cache[cache_key]
 
         prompts = self._load_with_fallback(module_name, agent_name, lang_code, subdirectory)
-        self._cache[cache_key] = prompts
+        # A missing resource is usually a packaging or startup-layout problem.
+        # Do not cache the empty result permanently: a later retry must be able
+        # to see resources that become available after startup.
+        if prompts:
+            self._cache[cache_key] = prompts
         return prompts
 
     def _build_cache_key(
@@ -98,7 +109,7 @@ class PromptManager:
     ) -> dict[str, Any]:
         """Load prompt file with language fallback."""
         prompt_dirs = self._candidate_prompt_dirs(module_name)
-        fallback_chain = self.LANGUAGE_FALLBACKS.get(lang_code, ["en"])
+        fallback_chain = self._fallback_chain(lang_code)
 
         for prompts_dir in prompt_dirs:
             for lang in fallback_chain:
@@ -114,15 +125,31 @@ class PromptManager:
         print(f"Warning: No prompt file found for {module_name}/{agent_name}")
         return {}
 
+    def _fallback_chain(self, lang_code: str) -> list[str]:
+        """Prompt-file lookup order for *lang_code*.
+
+        A regional code reuses its base locale's files ("zh-tw" -> "zh"), and a
+        language that ships none of its own lands on English rather than on
+        Chinese (#712) — the language directive, not the prompt file, is what
+        makes the model answer in the requested language.
+        """
+        base_chain = self.LANGUAGE_FALLBACKS.get(lang_code) or self.LANGUAGE_FALLBACKS.get(
+            lang_code.split("-", 1)[0], []
+        )
+        return list(dict.fromkeys([lang_code, *base_chain, "en"]))
+
     def _candidate_prompt_dirs(self, module_name: str) -> list[Path]:
         """Return legacy and current prompt roots for a module."""
         if module_name in self.NON_AGENT_MODULES:
-            legacy_dir = PROJECT_ROOT / "src" / module_name / "prompts"
-            current_dir = PROJECT_ROOT / "deeptutor" / module_name / "prompts"
+            # The mapped value is the on-disk path, which is not always the
+            # module name (a capability-owned pack lives one level deeper).
+            component = self.NON_AGENT_MODULES[module_name]
+            legacy_dir = PACKAGE_ROOT / "src" / component / "prompts"
+            current_dir = PACKAGE_ROOT / "deeptutor" / component / "prompts"
             return [legacy_dir, current_dir]
 
-        legacy_dir = PROJECT_ROOT / "src" / "agents" / module_name / "prompts"
-        current_dir = PROJECT_ROOT / "deeptutor" / "agents" / module_name / "prompts"
+        legacy_dir = PACKAGE_ROOT / "src" / "agents" / module_name / "prompts"
+        current_dir = PACKAGE_ROOT / "deeptutor" / "agents" / module_name / "prompts"
         return [legacy_dir, current_dir]
 
     def _resolve_prompt_path(
