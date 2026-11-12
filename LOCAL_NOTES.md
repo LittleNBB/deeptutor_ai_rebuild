@@ -11,6 +11,8 @@
 - Python：项目内 `.venv`（3.11.15）。**不要再依赖 conda `deeptutor_env`**。
 - 前端：`web/`（Next 16.2.3 + React 19，Node 22）。
 - 数据：`data/user/`（会话、设置、workspace、知识库索引）。
+- 远端：`origin` = `git@github.com:LittleNBB/deeptutor_ai_rebuild.git`（SSH）；分支 `main`。
+  改完代码/文档后提交并 `git push origin main`，方便回滚与异地继续。
 
 ## 二、启动 / 停止 / 自启
 
