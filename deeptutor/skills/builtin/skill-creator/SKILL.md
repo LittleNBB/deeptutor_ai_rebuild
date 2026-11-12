@@ -1,77 +1,54 @@
+
 ---
 name: skill-creator
-description: Design and author DeepTutor skills (SKILL.md packages). Use when the user wants to create a new skill, improve an existing skill, or asks how skills work.
+description: 设计和编写 DeepTutor 技能（SKILL.md 技能包）。当用户想要创建新技能、改进现有技能，或询问技能如何工作时使用。
 ---
 
-# Skill Creator
+# 技能创建器
 
-Guidance for authoring effective DeepTutor skills.
+编写高效 DeepTutor 技能的指南。
 
-## What a skill is
+## 什么是技能
 
-A skill is a self-contained capability package: a `SKILL.md` playbook plus
-optional `references/` files. The system prompt only carries each skill's
-name + description; the model fetches the full body with the `read_skill`
-tool when a task matches. Skills teach procedural knowledge — workflows,
-domain expertise, format conventions — that no model fully possesses.
+技能是一个自包含的能力包：一个 `SKILL.md` 操作手册加上可选的 `references/` 文件。系统提示词只包含每个技能的名称 + 描述；当任务匹配时，模型通过 `read_skill` 工具获取完整的正文内容。技能传授的是程序性知识——工作流、领域专业知识、格式规范——这些是任何模型都无法完全具备的。
 
-Behaviour/voice presets (tone, teaching style) are NOT skills — those are
-personas, managed separately.
+行为/语气预设（语调、教学风格）**不是**技能——那些是“人格”（personas），单独进行管理。
 
-## Anatomy
+## 结构剖析
 
 ```
 my-skill/
-├── SKILL.md          (required: frontmatter + instructions)
-└── references/       (optional: docs loaded on demand via read_skill)
+├── SKILL.md          (必需：前置元数据 + 指令)
+└── references/       (可选：通过 read_skill 按需加载的文档)
 ```
 
-Frontmatter schema:
+Frontmatter（前置元数据）架构：
 
 ```yaml
 ---
-name: my-skill            # lowercase, digits, hyphens; max 64 chars
-description: One line stating WHAT it does and WHEN to use it.
-tags: [tool]              # optional, user-facing organisation
-always: false             # optional: eager-inject into every turn
-requires:                 # optional availability gates
-  bins: [git]             # host CLI binaries
-  env: [GITHUB_TOKEN]     # environment variables
-  sandbox: shell          # needs the shell execution sandbox
+name: my-skill            # 小写字母、数字、连字符；最多 64 个字符
+description: 一句话说明它“做什么”以及“何时使用”。
+tags: [tool]              # 可选，面向用户的组织标签
+always: false             # 可选：立即注入到每一轮对话中
+requires:                 # 可选：可用性门槛
+  bins: [git]             # 主机 CLI 二进制文件
+  env: [GITHUB_TOKEN]     # 环境变量
+  sandbox: shell          # 需要 shell 执行沙箱
 ---
 ```
 
-## Core principles
+## 核心原则
 
-1. **The description is the trigger.** It is the only text the model sees
-   before deciding to read the skill. State both what the skill does and
-   the situations that should trigger it. Put ALL "when to use" guidance
-   here — a "When to Use" section in the body is read too late.
-2. **Concise is key.** The context window is shared. Assume the model is
-   already smart; only add what it doesn't know. Challenge every paragraph:
-   does it justify its token cost?
-3. **Match freedom to fragility.** Open-ended tasks → heuristics and
-   principles (high freedom). Fragile, error-prone sequences → exact steps
-   to follow (low freedom).
-4. **Progressive disclosure.** Keep `SKILL.md` under ~500 lines. Move
-   schemas, long examples, and variant-specific details into
-   `references/<file>.md`, and link them from `SKILL.md` with a clear note
-   on when to read each (the model fetches them with
-   `read_skill(name, file="references/<file>.md")`).
-5. **No auxiliary files.** No README, changelog, or setup guides inside a
-   skill — only what the model needs to do the job.
+1. **描述即是触发器。** 它是模型在决定读取技能之前看到的唯一文本。要同时说明技能做什么以及什么情况会触发它。把所有的“何时使用”指导都放在这里——把“何时使用”的章节写在正文里就太晚了。
+2. **简洁是关键。** 上下文窗口是共享的。假设模型已经很聪明了；只补充它不知道的内容。对每一个段落提出质疑：它是否值得消耗这些 token？
+3. **自由度与脆弱性相匹配。** 开放式任务 → 启发式方法和原则（高自由度）。脆弱、容易出错的序列 → 遵循确切的步骤（低自由度）。
+4. **渐进式披露。** 保持 `SKILL.md` 在约 500 行以内。将架构、长示例和特定变体的细节移到 `references/<file>.md` 中，并从 `SKILL.md` 链接到它们，明确说明何时读取每个文件（模型使用 `read_skill(name, file="references/<file>.md")` 来获取它们）。
+5. **无辅助文件。** 技能内不要有 README、更新日志或设置指南——只保留模型完成工作所需的内容。
 
-## Writing workflow
+## 编写工作流
 
-1. **Collect concrete usage examples.** Ask the user: "What would you say
-   that should trigger this skill? What should it do?" Stop when the
-   trigger phrases and expected behaviour are clear.
-2. **Plan reusable content.** For each example, identify what knowledge is
-   re-derived every time — that belongs in the skill (body or references).
-3. **Draft the skill.** Imperative form throughout. Frontmatter first;
-   verify the description passes the trigger test: would a model reading
-   only this line know when to use the skill?
-4. **Create it.** Use the skill management UI (Space → Skills) or the
-   skills API. The name becomes the directory name.
-5. **Iterate from real use.** After the skill fires on real tasks, tighten
-   what the model stumbled over and delete what it never needed.
+1. **收集具体的使用示例。** 询问用户：“你会说什么话来触发这个技能？它应该做什么？”当触发短语和预期行为明确时停止。
+2. **规划可复用的内容。** 对于每个示例，找出每次都会重新推导的知识——这些属于技能内容（正文或参考资料）。
+3. **起草技能。** 通篇使用祈使句。首先写 Frontmatter；验证描述是否通过了触发测试：一个只读这一行的模型会知道何时使用该技能吗？
+4. **创建它。** 使用技能管理 UI（Space → Skills）或 skills API。名称将成为目录名。
+5. **从真实使用中迭代。** 在技能于真实任务中触发后，修正模型遇到障碍的地方，并删除它从不需要的内容。

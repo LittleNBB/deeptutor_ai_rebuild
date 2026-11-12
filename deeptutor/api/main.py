@@ -177,6 +177,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to initialize LLM client at startup: {e}")
 
+    # Warm the optional cross-encoder in the background so the first knowledge
+    # query does not pay the torch/sentence-transformers import cost.
+    try:
+        from deeptutor.services.rag.pipelines.llamaindex.rerank import (
+            warm_up_configured_reranker,
+        )
+
+        warm_up_configured_reranker()
+    except Exception:
+        logger.debug("Reranker warmup unavailable", exc_info=True)
+
     try:
         from deeptutor.events.event_bus import get_event_bus
 

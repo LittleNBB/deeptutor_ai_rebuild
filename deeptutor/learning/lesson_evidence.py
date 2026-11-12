@@ -11,11 +11,14 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import math
+import re
 from pathlib import Path
 import time
 from typing import Any
 import unicodedata
+from dataclasses import replace
 
 from deeptutor.core.capability_protocol import CapabilityPrerequisiteError
 from deeptutor.learning.policy import find_knowledge_point
@@ -28,6 +31,8 @@ from deeptutor.services.rag.source_pages import (
     render_source_page,
     resolve_source,
 )
+
+logger = logging.getLogger(__name__)
 
 SCHEMA = 1
 PREPARATION_VERSION = 2
@@ -420,44 +425,114 @@ def question_snapshot(store: Any, progress: Any, kp_id: str) -> dict[str, Any]:
     return json.loads(json.dumps(evidence))
 
 
+def _strip_reasoning(text: str) -> str:
+    """Drop provider-emitted reasoning blocks that may wrap JSON answers."""
+    for tag in ("think", "thinking", "reasoning"):
+        text = re.sub(
+            rf"<\s*{tag}\b[^>]*>.*?<\s*/\s*{tag}\s*>",
+            " ",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+    return text
+
+
+def _balanced_json_objects(text: str) -> list[str]:
+    """Yield every top-level {...} span, string-aware and escape-aware."""
+    objects: list[str] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                objects.append(text[start : index + 1])
+                start = -1
+    return objects
+
+
 def _json_response(text: str) -> dict[str, Any]:
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1].rsplit("```", 1)[0]
-    try:
-        result = json.loads(text)
-    except (ValueError, TypeError) as exc:
-        raise LessonUnavailable(
-            "The model returned an invalid source-selection response. Please retry."
-        ) from exc
-    if not isinstance(result, dict):
+    cleaned = _strip_reasoning(text).strip()
+    candidates: list[str] = [cleaned]
+    candidates.extend(
+        match.group(1)
+        for match in re.finditer(r"```(?:json)?\s*(.*?)```", cleaned, re.DOTALL | re.IGNORECASE)
+    )
+    candidates.extend(_balanced_json_objects(cleaned))
+    saw_json = False
+    for candidate in candidates:
+        candidate = candidate.strip().strip("`").strip()
+        if not candidate:
+            continue
+        try:
+            result = json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+        saw_json = True
+        if isinstance(result, dict):
+            return result
+    if saw_json:
         raise LessonUnavailable("The source-selection response is not an object.")
-    return result
+    raise LessonUnavailable(
+        "The model returned an invalid source-selection response. Please retry."
+    )
 
 
 async def _ask(
     config: Any, instruction: str, payload: Any, images: list[dict[str, Any]] | None = None
 ) -> dict[str, Any]:
     from deeptutor.services.llm.factory import complete_with_config
+    from deeptutor.services.llm.structured_retry import payload_with_reasoning_retry
 
     content = [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]
     content.extend(images or [])
-    try:
-        response = await complete_with_config(
-            config=config,
+
+    async def run(reasoning_effort: str | None) -> str:
+        effective = config if reasoning_effort is None else replace(
+            config, reasoning_effort=reasoning_effort
+        )
+        return await complete_with_config(
+            config=effective,
             prompt="",
             messages=[
                 {"role": "system", "content": instruction},
                 {"role": "user", "content": content},
             ],
-            max_tokens=1800,
+            max_tokens=3000,
             allow_image_fallback=False,
+        )
+
+    try:
+        response = await payload_with_reasoning_retry(
+            run,
+            is_usable=lambda value: isinstance(value, dict) and bool(value),
+            logger_instance=logger,
         )
     except Exception as exc:
         raise LessonUnavailable(
             "The configured model could not complete source preparation. Check the model connection and retry."
         ) from exc
-    return _json_response(response)
+    if response is None:
+        raise LessonUnavailable(
+            "The model returned an invalid source-selection response. Please retry."
+        )
+    return response
 
 
 def image_message(sources: list[dict[str, Any]]) -> dict[str, Any]:

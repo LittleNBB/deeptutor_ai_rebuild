@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 import logging
 import math
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any, Callable
 
 from llama_index.core.schema import MetadataMode, NodeWithScore
@@ -79,6 +79,29 @@ def _sigmoid(value: float) -> float:
 def _identity_logits(scores: Any) -> Any:
     """Request raw cross-encoder logits from SentenceTransformers."""
     return scores
+
+
+def warm_up_configured_reranker() -> None:
+    """Load the configured reranker in a daemon thread.
+
+    Torch/sentence-transformers import costs tens of seconds on a cold process;
+    paying it during startup keeps the first knowledge query responsive.
+    """
+
+    def _warm() -> None:
+        try:
+            from deeptutor.services.rag.pipelines.llamaindex.config import (
+                retrieval_config_from_settings,
+            )
+
+            model_name = retrieval_config_from_settings().reranker_model
+            if not model_name:
+                return
+            _cross_encoder(model_name)
+        except Exception:  # pragma: no cover - warmup must never break startup
+            logger.debug("Reranker warmup failed", exc_info=True)
+
+    Thread(target=_warm, name="reranker-warmup", daemon=True).start()
 
 
 def rerank_nodes(
