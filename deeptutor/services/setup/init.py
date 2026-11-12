@@ -80,7 +80,7 @@ DEFAULT_AGENTS_SETTINGS: dict[str, Any] = {
         "solve": {"temperature": 0.3, "max_tokens": 8192},
         "research": {"temperature": 0.5, "max_tokens": 12000},
         "question": {"temperature": 0.7, "max_tokens": 4096},
-        "co_writer": {"temperature": 0.7, "max_tokens": 4096},
+        "co_writer": {"temperature": 0.7, "max_tokens": 32768},
         "visualize": {"temperature": 0.15, "max_tokens": 16000},
         # A book spine is one JSON payload holding a concept graph plus every
         # chapter, and a reasoning model pays for its hidden tokens out of the

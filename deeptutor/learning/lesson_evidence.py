@@ -514,7 +514,7 @@ async def _ask(
                 {"role": "system", "content": instruction},
                 {"role": "user", "content": content},
             ],
-            max_tokens=3000,
+            max_tokens=16384,
             allow_image_fallback=False,
         )
 

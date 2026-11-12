@@ -136,3 +136,16 @@ DSH 的 Mnemon 文档里有三份更细的记录（搜索 “DeepTutor”）：
   实际服务在 conda 子进程，两个环境都必须装 sentence-transformers，改依赖时两边同步。
 - 排查：`grep "Source-selection parse failed" data/user/logs/deeptutor.jsonl`；
   `tail data/user/logs/backend-8001.err.log` 看 `Loading weights`。
+
+## 十一、输出预算（2026-11-12）
+
+- 原则：`max_tokens` 是**上限**，不是目标。抬高它只保证“需要长文本时不被截断”，短回答仍会自然结束。
+- 运行时预算在 `data/user/settings/agents.yaml`（该目录不入 git）：
+  - `chat.exploring=32768`、`chat.responding=65536`
+  - `research.block=32768`、`research.report_section=65536`，其余研究阶段 16384
+  - `question.answering=32768`，规划/修复/收尾 16384、工具摘要 4096
+  - `solve=32768`、`co_writer=32768`
+- 代码级默认（新装也生效）：`deeptutor/services/config/loader.py` 的 `DEFAULT_CHAT/RESEARCH/QUESTION_PARAMS`；`deeptutor/services/config/capabilities_settings.py` 的 `_SIMPLE_LLM_DEFAULTS`。
+- 学习流程里的单次调用：`deeptutor/learning/lesson_evidence.py` 的 `_ask`（选源）16384、`deeptutor/learning/semantic_assessment.py` 16384。
+- 关键坑：推理模型把 `reasoning_tokens` 计入同一个 `max_tokens`；预算过小会出现“思考吃满、content 为空”（旧 1800 就是这么炸的）。现先用 max effort，结构化调用失败时用 `structured_retry` 以 low effort 重试。
+- DeepSeek API 实测接受 `max_tokens=65536`（18k prompt 也正常）；改完代码需重启后端，改 agents.yaml 即时生效。

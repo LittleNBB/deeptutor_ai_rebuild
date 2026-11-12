@@ -155,7 +155,7 @@ async def _request(config, instruction, payload, sources=None, native_images=Non
         response = await complete_with_config(
             config=config or get_llm_config(),
             prompt="",
-            max_tokens=2200,
+            max_tokens=16384,
             messages=messages,
             allow_image_fallback=False,
         )

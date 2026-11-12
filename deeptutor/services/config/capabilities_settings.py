@@ -52,17 +52,17 @@ _AGENTS_YAML_CAPABILITY_SECTIONS: dict[str, tuple[str, ...]] = {
 }
 
 _SIMPLE_LLM_DEFAULTS: dict[str, dict[str, Any]] = {
-    "solve": {"temperature": 0.3, "max_tokens": 8192},
-    "research": {"temperature": 0.5, "max_tokens": 16834},
-    "question": {"temperature": 0.7, "max_tokens": 4096},
+    "solve": {"temperature": 0.3, "max_tokens": 32768},
+    "research": {"temperature": 0.5, "max_tokens": 32768},
+    "question": {"temperature": 0.7, "max_tokens": 32768},
     # The visualize loop's own defaults, unchanged from when they were written
     # into the pipeline construction: a user who never touches this keeps the
     # behaviour they had, and one whose reasoning model eats the budget can now
     # raise it (#1546).
-    "visualize": {"temperature": 0.15, "max_tokens": 16000},
-    "co_writer": {"temperature": 0.6, "max_tokens": 4096},
-    "vision_solver": {"temperature": 0.3, "max_tokens": 12000},
-    "math_animator": {"temperature": 0.2, "max_tokens": 16834},
+    "visualize": {"temperature": 0.15, "max_tokens": 32768},
+    "co_writer": {"temperature": 0.6, "max_tokens": 32768},
+    "vision_solver": {"temperature": 0.3, "max_tokens": 32768},
+    "math_animator": {"temperature": 0.2, "max_tokens": 32768},
 }
 
 # main.yaml subtrees that capabilities read at runtime (besides LLM params).

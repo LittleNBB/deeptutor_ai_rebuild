@@ -290,8 +290,8 @@ DEFAULT_CHAT_PARAMS: dict[str, Any] = {
     # Exploring-loop budget: max LLM rounds in one turn's loop (a round
     # without tool calls ends the loop early — the normal exit).
     "max_rounds": 8,
-    "exploring": {"max_tokens": 1600},
-    "responding": {"max_tokens": 8000},
+    "exploring": {"max_tokens": 32768},
+    "responding": {"max_tokens": 65536},
 }
 
 # A capability that makes several different LLM calls cannot be described by
@@ -313,21 +313,21 @@ DEFAULT_CHAT_PARAMS: dict[str, Any] = {
 # the table changes nothing until somebody edits agents.yaml. Stage names are
 # the pipeline's own vocabulary — they are the key a user types.
 DEFAULT_QUESTION_PARAMS: dict[str, Any] = {
-    "answering": {"max_tokens": 4000},
-    "planning": {"max_tokens": 6000},
-    "quiz_finish": {"max_tokens": 3000},
-    "repair": {"max_tokens": 2500},
-    "tool_summarizer": {"max_tokens": 800},
+    "answering": {"max_tokens": 32768},
+    "planning": {"max_tokens": 16384},
+    "quiz_finish": {"max_tokens": 16384},
+    "repair": {"max_tokens": 16384},
+    "tool_summarizer": {"max_tokens": 4096},
 }
 
 DEFAULT_RESEARCH_PARAMS: dict[str, Any] = {
-    "note": {"max_tokens": 1500},
-    "block": {"max_tokens": 6000},
-    "outline": {"max_tokens": 2000},
-    "report_outline": {"max_tokens": 2000},
-    "report_intro": {"max_tokens": 3000},
-    "report_section": {"max_tokens": 12000},
-    "report_conclusion": {"max_tokens": 3000},
+    "note": {"max_tokens": 16384},
+    "block": {"max_tokens": 32768},
+    "outline": {"max_tokens": 16384},
+    "report_outline": {"max_tokens": 16384},
+    "report_intro": {"max_tokens": 16384},
+    "report_section": {"max_tokens": 65536},
+    "report_conclusion": {"max_tokens": 16384},
 }
 
 DEFAULT_EXPLORE_CONTEXT_PARAMS: dict[str, Any] = {
