@@ -1,7 +1,7 @@
 # DeepTutor 本地部署笔记（非上游文件）
 
 > 本文件由本地维护添加，记录与上游不同的运行方式、本地定制与踩坑，供未来的自己快速接手。
-> 上游代码以 git 历史为准；最后更新：2026-11-05。
+> 上游代码以 git 历史为准；最后更新：2026-11-14。
 
 ## 一、版本与环境
 
@@ -149,3 +149,36 @@ DSH 的 Mnemon 文档里有三份更细的记录（搜索 “DeepTutor”）：
 - 学习流程里的单次调用：`deeptutor/learning/lesson_evidence.py` 的 `_ask`（选源）16384、`deeptutor/learning/semantic_assessment.py` 16384。
 - 关键坑：推理模型把 `reasoning_tokens` 计入同一个 `max_tokens`；预算过小会出现“思考吃满、content 为空”（旧 1800 就是这么炸的）。现先用 max effort，结构化调用失败时用 `structured_retry` 以 low effort 重试。
 - DeepSeek API 实测接受 `max_tokens=65536`（18k prompt 也正常）；改完代码需重启后端，改 agents.yaml 即时生效。
+
+## 十二、图表可读性：mermaid 宽图与知识库页图（2026-11-14 修复）
+
+- 症状（用户口径：列表 / 表格 / mermaid / 图片都算“图表”）：
+  1. 精通之路里横向排布的 mermaid 信号流程图被压成一条细线，字号约 5px，几乎不可读。
+  2. 知识库检索返回的教材 PDF 页图固定在 384px 高的矮框里（实际只画 276×384），点击只打开右侧抽屉，无法放大。
+- 根因（均在前端渲染层，与模型生成写法无关）：
+  1. `web/components/Mermaid.tsx` 的 `mermaid.initialize({ flowchart: { useMaxWidth: true } })` 让
+     mermaid 输出 `width="100%"` + `max-width`。会话栏宽 885px 时，viewBox `0 0 2738.97 131` 被压成
+     885×42，16px 标签实际 ≈4.7px；图越宽字越小。
+  2. `web/components/chat/home/MasterySourcePresentation.tsx:30` 的 `<div className="h-96 w-full">`
+     把页图钉死为 384px 高，图片 `max-h-full max-w-full object-contain` 只能画到 276×384。
+- 处理（3 处修改 + 1 个新组件）：
+  - `web/components/Mermaid.tsx`：`flowchart.useMaxWidth: false`；新增 `restoreIntrinsicSize(svg)`，
+    用 DOMParser 从 viewBox 读宽高、写回 `width`/`height` 像素属性并去掉 `max-width`，容器
+    `overflow-x-auto` 横向滚动。**不提供点击全屏**：试过 ZoomableLightbox（最小 75%），2738px 的图
+    在 75% 下仍比窗口宽，反而“点开也看不全”，已移除——与 genui 图表一致，只滚动、不缩放。
+  - `web/components/chat/preview/previewers/ImagePreview.tsx`：图片外包 button，点击打开全屏浮层
+    （blob:URL 的页图也能用），浮层内 `max-w-none` 原图 + 缩放。
+  - `web/components/common/ZoomableLightbox.tsx`（新增）：全屏浮层，打开时轮询测量并
+    `fit = min(1, (vw-32)/w, (vh-32)/h)` 自动适配，提供缩小/百分比/放大/关闭，Esc 关闭并锁 body 滚动。
+  - `web/components/chat/home/MasterySourcePresentation.tsx:30`：`h-96` → `h-[min(72vh,760px)]`。
+  - 未新增 i18n key，复用已存在的 Zoom in / Zoom out / Close / Fullscreen（中文渲染为 放大/缩小/关闭/全屏）。
+- 验证：
+  - 真实会话：mermaid svg 2739×131、字号 16px，容器 885px 宽出现横向滚动条；修复前为 885×42。
+  - 知识库页图：卡内 518×720；点击后浮层内 664×923（自动适配），标题带 “PDF page 13”。
+  - `cd web && npx tsc --noEmit -p tsconfig.json` 退出码 0；`/chat/<sessionId>` 返回 200。
+  - 复现检查：打开任意含宽 mermaid 的会话，应看到横向滚动条且字不再缩小；点知识库页图应弹全屏浮层。
+- 注意：
+  - 生产模式（前端 3782、`scripts/start_web.py`）读的是 `web/.next-deeptutor` 构建产物，
+    改完源码必须重新构建（或改用 dev 模式）才生效；dev 模式（`npm run dev`）是热更新的。
+  - 若希望长图彻底不用滚动，应在生成端让 mermaid 改竖排（`flowchart TB`）或分成两行，而不是再压渲染。
+- 回滚：`git revert <本提交>` 即可；本次改动不含配置、数据或后端逻辑。

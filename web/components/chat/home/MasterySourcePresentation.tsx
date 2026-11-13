@@ -27,7 +27,7 @@ function SourcePage({ page }: { page: Page }) {
   const url = state.kind === "ready" ? state.objectUrl : null;
   return <figure className="my-3 rounded-lg border border-[var(--border)] p-2">
     <figcaption className="mb-2 break-words text-xs text-[var(--muted-foreground)]">{page.title}</figcaption>
-    {url ? <div className="h-96 w-full"><ImagePreview url={url} filename={page.title} /></div>
+    {url ? <div className="h-[min(72vh,760px)] w-full"><ImagePreview url={url} filename={page.title} /></div>
       : <p role="status" className="text-sm">{state.kind === "error" ? t("Failed to load image.") : t("Loading...")}</p>}
   </figure>;
 }

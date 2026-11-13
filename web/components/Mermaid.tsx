@@ -55,12 +55,43 @@ function applyMermaidTheme(mermaid: (typeof import("mermaid"))["default"]) {
     securityLevel: "strict",
     fontFamily: "ui-sans-serif, system-ui, sans-serif",
     flowchart: {
-      useMaxWidth: true,
+      // The chat column is narrow; scaling the diagram to 100% width shrinks
+      // 16px labels to ~4px. Render at intrinsic size instead and let the
+      // container scroll horizontally, like the genui diagrams.
+      useMaxWidth: false,
       htmlLabels: false,
       curve: "basis",
     },
     themeVariables: themeVariablesFromCss(),
   });
+}
+
+/**
+ * Mermaid emits width="100%" (and a max-width style) for most diagram types, so
+ * the SVG always collapses to the container width. Restore the intrinsic pixel
+ * size taken from the viewBox; the wrapper scrolls horizontally instead.
+ */
+function restoreIntrinsicSize(svg: string): string {
+  try {
+    const doc = new DOMParser().parseFromString(svg, "image/svg+xml");
+    const root = doc.documentElement;
+    const viewBox = root.getAttribute("viewBox");
+    if (!viewBox) return svg;
+    const parts = viewBox.split(/[\s,]+/).map(Number);
+    const width = parts[2];
+    const height = parts[3];
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+      return svg;
+    }
+    root.setAttribute("width", String(Math.round(width)));
+    root.setAttribute("height", String(Math.round(height)));
+    root.style.removeProperty("max-width");
+    root.style.width = `${Math.round(width)}px`;
+    root.style.height = `${Math.round(height)}px`;
+    return new XMLSerializer().serializeToString(root);
+  } catch {
+    return svg;
+  }
 }
 
 function cleanupMermaidOrphans(id: string) {
@@ -119,7 +150,7 @@ export const Mermaid: React.FC<MermaidProps> = ({ chart, className = "" }) => {
         cleanupMermaidOrphans(id);
         const { svg: renderedSvg } = await mermaid.render(id, chart.trim());
         if (!cancelled) {
-          setSvg(renderedSvg);
+          setSvg(restoreIntrinsicSize(renderedSvg));
           setError(null);
         }
       } catch (err) {
@@ -170,11 +201,13 @@ export const Mermaid: React.FC<MermaidProps> = ({ chart, className = "" }) => {
   }
 
   return (
-    <div
-      ref={containerRef}
-      className={`my-6 flex justify-center overflow-x-auto ${className}`}
-      dangerouslySetInnerHTML={{ __html: svg }}
-    />
+    <div className={`my-6 ${className}`}>
+      <div
+        ref={containerRef}
+        className="overflow-x-auto rounded-lg [&_svg]:mx-auto [&_svg]:block"
+        dangerouslySetInnerHTML={{ __html: svg }}
+      />
+    </div>
   );
 };
 
