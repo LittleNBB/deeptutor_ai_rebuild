@@ -969,6 +969,51 @@ async def list_topic_sessions(path_id: str):
     }
 
 
+@router.post("/topics/{path_id}/sessions", status_code=201)
+async def create_topic_session(path_id: str):
+    """Open a conversation on this topic before it has a first message.
+
+    The sidebar's new-conversation action lists conversations from the store,
+    so a draft that only lived in the browser would leave the click looking
+    like nothing happened. The row is created here, bound to the path and
+    carrying the preferences a first mastery turn writes, so the conversation
+    appears next to the topic's other conversations immediately and opens in
+    study mode.
+    """
+    _validate_book_id(path_id)
+    learning_store = LearningStore()
+    if not await asyncio.to_thread(learning_store.exists, path_id):
+        raise HTTPException(status_code=404, detail="Mastery topic not found")
+    from deeptutor.services.session import get_session_store
+
+    session_store = get_session_store()
+    record = await session_store.create_session()
+    session_id = str(record["session_id"])
+    try:
+        await session_store.update_session_preferences(
+            session_id,
+            {
+                "workspace_mode": "mastery_path",
+                "mastery_path_id": path_id,
+                "mastery_session_mode": "study",
+            },
+        )
+        await asyncio.to_thread(learning_store.bind_session, path_id, session_id)
+    except Exception:
+        # A conversation no topic lists cannot be opened from the sidebar, so
+        # remove it rather than leave a blank row behind.
+        with suppress(Exception):
+            await session_store.delete_session(session_id)
+        raise
+    return {
+        "path_id": path_id,
+        "session_id": session_id,
+        "title": record.get("title") or "",
+        "created_at": record.get("created_at") or 0,
+        "updated_at": record.get("updated_at") or 0,
+    }
+
+
 class SetSessionModeRequest(BaseModel):
     mode: str = Field(..., max_length=32)
 

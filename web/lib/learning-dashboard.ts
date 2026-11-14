@@ -29,6 +29,10 @@ export interface LearningActivity {
   updatedAt: number
   createdAt: number
   progress?: number
+  /** The mastery path this record teaches, when the record is one. */
+  pathId?: string
+  /** The content workspace the record lives in, so links stay scoped. */
+  contentWorkspaceId?: string
 }
 export function isWatchingSession(session: SessionSummary): boolean {
   return (
@@ -66,6 +70,8 @@ export function allLearningActivity(sources: LearningSources): LearningActivity[
         kind: 'mastery' as const,
         title: topic.name || topic.metadata.goal,
         href: scopedUrl(masteryTopicRoute(topic.path_id, ''), topic.content_workspace_id || ''),
+        pathId: topic.path_id,
+        contentWorkspaceId: topic.content_workspace_id || '',
         updatedAt: topic.updated_at,
         createdAt: topic.metadata.created_at || topic.updated_at,
         progress: topic.map.counts.total ? topic.map.counts.mastered / topic.map.counts.total : 0,

@@ -202,3 +202,20 @@ DSH 的 Mnemon 文档里有三份更细的记录（搜索 “DeepTutor”）：
   - 精通实测：同一会话续讲后，两次 `mastery_note_explained` 均被接受（partially_explained），正文只有一个「一句话收束」，未再出现三段重复收尾。
 - 关键坑：直接 `cd web && npm run build` 写的是 `web/.next`，生产读的是 `web/.next-deeptutor`；必须 `DEEPTUTOR_NEXT_DIST_DIR=.next-deeptutor npm run build`（或走 `scripts/start_web.py`），否则构建产物时间戳不变、页面毫无变化。
 - 回滚：`git revert <本提交>`；若只想关掉默认人格，删掉 executor.py 里 `if not requested_persona:` 分支并重启后端。
+
+## 十四、精通记录行内的“新建会话”加号（2026-11-14）
+
+- 需求（用户原话，m00666）：“我希望是像dsh里一样，点加号在对应区域下新建对话，是在这个精通之路下新增会话，而不是新增chat……点击新建对话后出现一个新的会话和那两个会话同级。” 顶部全局 ⊕ 保留（m00710：“不用删。”）。
+- 界面：`web/components/sidebar/LearningNavigation.tsx` 的记录行（`.dt-record-node-row`）末尾、标题链接之后新增 `.dt-record-new-session` 按钮（Plus 图标，`navigation.newChat` 作 aria-label/title），仅 `record.kind === 'mastery'` 且带 `pathId` 时出现；样式在 `web/features/ui-layout/modern/modern.css`（常驻 55% 不透明度，悬停/激活/聚焦时 100%）。
+- 数据：`web/lib/learning-dashboard.ts` 的 `LearningActivity` 新增可选 `pathId`、`contentWorkspaceId`，mastery 分支填 `topic.path_id` 与 `topic.content_workspace_id`，避免跨工作区建错位置。
+- 点击即建（关键）：后端原本没有创建会话的 HTTP 接口（普通“新对话”也要等首条消息才建行），仅导航到 `/learning/mastery/<path>/sessions` 时侧栏不会出现同级新行。新增：
+  - `deeptutor/api/routers/mastery_path.py`：`POST /api/mastery-paths/topics/{path_id}/sessions`（201）。校验 topic 存在（404），`get_session_store().create_session()` 建行，`update_session_preferences` 写 `workspace_mode=mastery_path`、`mastery_path_id`、`mastery_session_mode=study`，再 `LearningStore().bind_session(path_id, session_id)`；任一步失败则尽力 `delete_session` 并原样抛出，避免留下无主空行。
+  - 响应 `{path_id, session_id, title, created_at, updated_at}`；`GET /topics/{path_id}/sessions` 本来就会列出无消息会话，所以新行立即出现在记录下。
+- 前端调用：`web/lib/learning-api.ts` 新增 `createMasteryTopicSession(pathId, workspaceId)`，用 `scopedUrl(..., workspaceId)` 显式带 `dt_workspace`；创建成功后 `window.location.assign(masterySessionRoute(...))`，整页加载让侧栏重新拉到这条会话；请求期间按钮 disabled，失败 `notify(t('Action failed'))`。
+- 验证（生产 3782 + 后端 8001，Edge/Playwright）：
+  - `POST` 返回 `unified_...`，`GET /topics/<id>/sessions` 从 2 条变 3 条，新增行 title=New conversation、message_count=0；`sessions.preferences_json` 中三项偏好正确。
+  - 在 `/learning/mastery/<path>` 点击行内 ⊕：跳转 `/learning/mastery/<path>/sessions/unified_...`，落地页直接进入该知识点的学习界面；刷新后侧栏记录展开，新会话排在最前，与两条旧会话同级。
+  - 清理探针数据后 `mastery_path_sessions` 恢复为原 2 条，旧会话标题/时间未变。
+- 构建/部署（承接第十三节）：`DEEPTUTOR_NEXT_DIST_DIR=.next-deeptutor npm run build` 之前必须先停 3782（Windows 上 `libvips-42.dll` 被占用会 EPERM）；启动脚本 `X:/AI/_start_web.ps1`（PORT=3782、API 8001、DEEPTUTOR_HOME），后端 `X:/AI/_restart_backend.ps1`。
+- 回滚：`git revert <本提交>`；若只想撤掉行内加号，删掉 `LearningNavigation.tsx` 的 mastery 按钮与 `modern.css` 的 `.dt-record-new-session` 规则，后端接口可保留（无调用方）。
+

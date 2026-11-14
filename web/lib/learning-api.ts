@@ -1,5 +1,6 @@
 import type { LearningOrigin } from "@/lib/learning-library";
 import { apiUrl, apiFetch } from "./api";
+import { scopedUrl } from "@/lib/workspace-scope";
 
 export interface ModuleInit {
   id: string;
@@ -851,6 +852,38 @@ export function setMasteryObjectiveOverride(
     },
     mastered ? "mark objective mastered" : "restore objective assessment",
   );
+}
+
+export interface CreatedTopicSession {
+  path_id: string;
+  session_id: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
+}
+
+/**
+ * Open a conversation on a topic before it has a first message, so the
+ * sidebar's new-conversation action leaves a row among the topic's others
+ * instead of a draft that vanishes on reload.
+ */
+export async function createMasteryTopicSession(
+  pathId: string,
+  workspaceId = "",
+): Promise<CreatedTopicSession> {
+  const path = `/api/mastery-paths/topics/${encodeURIComponent(pathId)}/sessions`;
+  const res = await apiFetch(scopedUrl(path, workspaceId), { method: "POST" });
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const payload = (await res.json()) as { detail?: string };
+      detail = payload.detail ? `: ${payload.detail}` : "";
+    } catch {
+      // The status remains actionable when a proxy returns HTML.
+    }
+    throw new Error(`Failed to open a conversation (${res.status})${detail}`);
+  }
+  return res.json() as Promise<CreatedTopicSession>;
 }
 
 export async function fetchMasteryTopicSessions(

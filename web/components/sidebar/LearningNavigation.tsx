@@ -14,6 +14,10 @@ import { useSidebarDrawer } from '@/components/layout/AppShell'
 import { browserStorage } from '@/shared/storage'
 import { displaySessionTitle } from '@/lib/session-title'
 import type { SessionSummary } from '@/lib/session-api'
+import { createMasteryTopicSession } from '@/lib/learning-api'
+import { masterySessionRoute } from '@/lib/learning-routes'
+import { scopedUrl } from '@/lib/workspace-scope'
+import { notify } from '@/lib/notifications'
 
 const OPEN_KEY = 'deeptutor.navigation.learning.open'
 
@@ -53,6 +57,7 @@ export function LearningNavigation({
   const { sources, loading, failed, retry } = useLearningIndex(active)
   const view = useRecordView('deeptutor.navigation.learning.sort')
   const [open, setOpen] = useState<Record<string, boolean>>({})
+  const [creating, setCreating] = useState<string | null>(null)
   useLayoutEffect(() => {
     // Restore which records were left open before paint, without a mismatch.
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -126,6 +131,29 @@ export function LearningNavigation({
                   (open[row.key] ?? row.sessions.some(session => session.session_id === sessions?.activeSessionId))
                 }
                 onToggle={next => toggle(row.key, next)}
+                creating={creating === row.key}
+                onNewSession={async () => {
+                  const pathId = row.record.pathId
+                  if (!pathId || creating) return
+                  setCreating(row.key)
+                  try {
+                    const created = await createMasteryTopicSession(
+                      pathId,
+                      row.record.contentWorkspaceId || ''
+                    )
+                    // A full reload re-reads the records and their conversations,
+                    // so the new row is already among its siblings on arrival.
+                    window.location.assign(
+                      scopedUrl(
+                        masterySessionRoute(pathId, created.session_id, ''),
+                        row.record.contentWorkspaceId || ''
+                      )
+                    )
+                  } catch {
+                    setCreating(null)
+                    notify(t('Action failed'), { tone: 'error' })
+                  }
+                }}
               />
             )
           }
@@ -151,6 +179,8 @@ function RecordNode({
   render,
   open,
   onToggle,
+  creating,
+  onNewSession,
 }: {
   record: LearningActivity
   time: number
@@ -158,6 +188,8 @@ function RecordNode({
   render?: (rows: SessionSummary[]) => ReactNode
   open: boolean
   onToggle: (open: boolean) => void
+  creating?: boolean
+  onNewSession?: () => void | Promise<void>
 }) {
   const { t } = useTranslation()
   const drawer = useSidebarDrawer()
@@ -206,6 +238,21 @@ function RecordNode({
           )}
           <RecordTime seconds={time} />
         </Link>
+        {record.kind === 'mastery' && record.pathId && onNewSession && (
+          <button
+            type="button"
+            className="dt-record-new-session"
+            aria-label={t('navigation.newChat')}
+            title={t('navigation.newChat')}
+            disabled={creating}
+            onClick={() => {
+              // A row action must not also count as opening the record itself.
+              void onNewSession()
+            }}
+          >
+            <Plus size={14} strokeWidth={2} aria-hidden />
+          </button>
+        )}
       </div>
       {expanded && <div className="dt-record-children">{render!(sessions)}</div>}
     </div>
