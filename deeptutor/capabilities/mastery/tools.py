@@ -16,10 +16,12 @@ race on a shared object.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import logging
 import random
 import re
+import unicodedata
 from typing import TYPE_CHECKING, Any
 import uuid
 
@@ -120,6 +122,54 @@ _BUILD_SHAPE_ERROR = (
     "— every knowledge point needs a name of at least two characters."
 )
 logger = logging.getLogger(__name__)
+
+_QUOTE_NOISE_RE = re.compile(r"[\s*_~`#>|\-]+")
+
+
+def _quote_match_key(text: str) -> tuple[str, list[int]]:
+    """Fold formatting noise out while remembering where each kept character came from."""
+    chars: list[str] = []
+    origins: list[int] = []
+    for index, char in enumerate(text):
+        folded = unicodedata.normalize("NFKC", char).lower()
+        for piece in folded:
+            if _QUOTE_NOISE_RE.match(piece):
+                continue
+            chars.append(piece)
+            origins.append(index)
+    return "".join(chars), origins
+
+
+def _locate_published_quote(published: str, quote: str) -> tuple[int, int] | None:
+    """Find the delivered span a quote refers to, tolerating formatting drift.
+
+    A model can retype an otherwise literal quote with different whitespace,
+    emphasis markers or full-width punctuation. Exact matching stays first;
+    if that misses, compare folded text, and finally accept a near-identical
+    window (>= 0.9 similarity) so a typo cannot look like an untaught claim.
+    Text that was never delivered still fails both paths.
+    """
+    exact = published.rfind(quote)
+    if exact >= 0:
+        return exact, exact + len(quote)
+    folded_published, origins = _quote_match_key(published)
+    folded_quote, _ = _quote_match_key(quote)
+    if not folded_quote or not origins:
+        return None
+    position = folded_published.rfind(folded_quote)
+    if position >= 0:
+        return origins[position], origins[position + len(folded_quote) - 1] + 1
+    matcher = difflib.SequenceMatcher(None, folded_published, folded_quote, autojunk=False)
+    match = matcher.find_longest_match(0, len(folded_published), 0, len(folded_quote))
+    if match.size < max(12, len(folded_quote) // 4):
+        return None
+    window_start = max(0, match.a - match.b)
+    window_end = min(len(folded_published), window_start + len(folded_quote))
+    window = folded_published[window_start:window_end]
+    ratio = difflib.SequenceMatcher(None, window, folded_quote, autojunk=False).ratio()
+    if ratio < 0.9:
+        return None
+    return origins[window_start], origins[window_end - 1] + 1
 
 
 def _new_service() -> LearningService:
@@ -991,17 +1041,18 @@ class MasteryNoteExplainedTool(BaseTool):
                 success=False,
             )
         published = "".join(segment[2] for segment in segments)
-        start = published.rfind(quote)
-        if start < 0:
+        located = _locate_published_quote(published, quote)
+        if located is None:
             return ToolResult(
                 content="That excerpt has not been publicly delivered in this turn. Explain first, then record only what was taught; do not record a future plan.",
                 success=False,
             )
+        start, quote_end = located
         offset = 0
         matched = []
         for segment in segments:
             end = offset + len(segment[2])
-            if offset < start + len(quote) and end > start:
+            if offset < quote_end and end > start:
                 matched.append(segment)
             offset = end
         provenance = {

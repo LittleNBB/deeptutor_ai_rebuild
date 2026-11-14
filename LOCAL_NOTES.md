@@ -182,3 +182,23 @@ DSH 的 Mnemon 文档里有三份更细的记录（搜索 “DeepTutor”）：
     改完源码必须重新构建（或改用 dev 模式）才生效；dev 模式（`npm run dev`）是热更新的。
   - 若希望长图彻底不用滚动，应在生成端让 mermaid 改竖排（`flowchart TB`）或分成两行，而不是再压渲染。
 - 回滚：`git revert <本提交>` 即可；本次改动不含配置、数据或后端逻辑。
+
+## 十三、默认人格、侧栏新对话与精通记账容错（2026-11-14）
+
+- 需求（用户原话）：「1,和dsh新增对话一样就行，即你说的”左侧栏顶部（标题行右侧）常驻一个 ⊕“ 2,对话内容有部分重复，你自己看； 3,修改原teacher人格就行；」
+- 侧栏常驻新对话：`web/components/sidebar/SidebarShell.tsx` 打开态 `.dt-sidebar-header` 内、WorkspaceMenu 之后、搜索按钮之前新增一个 `Link href="/chat" className="dt-nav-icon"`（SquarePen 图标，Tooltip 复用 `navigation.newChat`，onClick 复用 `handleHomeClick`）；折叠态 60px 轨道原本就有新对话图标，未重复添加。
+- 默认人格：`deeptutor/services/session/turns/executor.py` 在解析 `payload["persona"]` 后增加回退——请求未指定人格时加载 `teacher`（文件缺失则不注入），显式选择始终优先。重启后端生效。
+  - 注意：人格仍是“每轮一个 prompt 块”，不是硬编码指令；用户切到别的人格或清空后仍按上述规则回退。
+- teacher 人格重写（`deeptutor/services/persona/presets/teacher/PERSONA.md` 与 `data/user/workspace/personas/teacher/PERSONA.md` 内容一致）：讲解优先（先动机/来由再公式，不拿追问代替讲解）、结构一律画图（Mermaid 优先竖排、教材优先呈现原页/原图并指出看哪一处）、按考点题型带练（计算题给步骤判据、答错指出哪一步并补同类题）、每轮只给一个下一步且不重复收尾。
+- 精通记账（`mastery_note_explained`）两处修复：
+  1. `deeptutor/capabilities/mastery/tools.py`：新增 `_quote_match_key` 与 `_locate_published_quote`——先精确 `rfind`，再按 NFKC/小写/去空白与 markdown 符号折叠匹配并映射回原文索引，最后用 `difflib.SequenceMatcher` 取 >=0.9 的近似窗口；未真正交付的文本仍返回原拒绝文案。
+  2. `deeptutor/capabilities/mastery/prompts/{zh,en}/mastery_loop.yaml`：要求「同一轮同一知识点只记一次，先把讲解写完再调用，调用后不重讲、不重复总结；引文逐字复制（含标点）」。
+  - 成因记录：旧实现只做 `published.rfind(quote)`，模型把计划措辞当引文（未交付）或只差一字（“这一个点的” vs “这个点的”）都会失败；模型还会先调用再讲解，造成正文重复收尾。
+- 验证：
+  - `py_compile` 通过；`cd web && npx tsc --noEmit` 退出码 0；YAML 可正常解析。
+  - 匹配器实测：精确/加粗 **T**/错别字「输人」都定位到同一片段；未来计划式引文与未交付内容返回 None。
+  - 生产前端 3782（重建 `.next-deeptutor`）：侧栏标题行出现「新对话」按钮，从 /space 点击后跳转 /chat。
+  - 默认人格实测：新会话未选人格时，回复按中文讲解风格输出，模型思维链里明确提到「persona 要求画图」。
+  - 精通实测：同一会话续讲后，两次 `mastery_note_explained` 均被接受（partially_explained），正文只有一个「一句话收束」，未再出现三段重复收尾。
+- 关键坑：直接 `cd web && npm run build` 写的是 `web/.next`，生产读的是 `web/.next-deeptutor`；必须 `DEEPTUTOR_NEXT_DIST_DIR=.next-deeptutor npm run build`（或走 `scripts/start_web.py`），否则构建产物时间戳不变、页面毫无变化。
+- 回滚：`git revert <本提交>`；若只想关掉默认人格，删掉 executor.py 里 `if not requested_persona:` 分支并重启后端。

@@ -629,6 +629,17 @@ class TurnExecutor:
                 if requested_persona
                 else ""
             )
+            if not requested_persona:
+                # Tutoring is the default voice of the product: a conversation
+                # that never picked a persona still gets the shipped teacher,
+                # while an explicit choice always wins and a missing persona
+                # file degrades to no injection.
+                default_persona = "teacher"
+                persona_context = load_visible_for_context(
+                    default_persona,
+                    workspace=get_persona_service(),
+                )
+                requested_persona = default_persona if persona_context else ""
             active_persona = requested_persona if persona_context else ""
 
             from deeptutor.services.skill.runtime import skill_manifest

@@ -392,6 +392,17 @@ export function SidebarShell({
       ) : (
         <div className="dt-sidebar-header">
           <WorkspaceMenu accountSlot={renderedFooter} onNavigate={() => drawer?.close()} />
+          <Tooltip label={t("navigation.newChat")} side="bottom" shortcut={SHORTCUTS.newChat}>
+            <Link
+              prefetch={false}
+              href="/chat"
+              onClick={handleHomeClick}
+              className="dt-nav-icon"
+              aria-label={t("navigation.newChat")}
+            >
+              <SquarePen size={16} strokeWidth={1.7} />
+            </Link>
+          </Tooltip>
           <Tooltip label={t("navigation.search")} side="bottom" shortcut={SHORTCUTS.search}>
             <button
               type="button"
