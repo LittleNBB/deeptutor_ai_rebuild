@@ -57,7 +57,6 @@ export default function ImagePreview({
           <button
             type="button"
             onClick={() => setExpanded(true)}
-            title={t("Zoom in")}
             aria-label={t("Zoom in")}
             className="flex h-full w-full cursor-zoom-in items-center justify-center"
           >

@@ -1,5 +1,7 @@
 "use client";
 
+import { useState } from "react";
+import { ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { StreamEvent } from "@/features/chat/model/protocol";
 import { apiUrl } from "@/lib/api";
@@ -21,15 +23,52 @@ function presentedPages(events: StreamEvent[], placed: ReadonlySet<string>): Pag
   return [...pages.values()].slice(0, 12);
 }
 
-function SourcePage({ page }: { page: Page }) {
+/** The page image itself, mounted only while the disclosure is open. */
+function SourcePageImage({ page }: { page: Page }) {
   const { t } = useTranslation();
   const state = useBinarySource(apiUrl(page.preview_url), "image/png");
   const url = state.kind === "ready" ? state.objectUrl : null;
-  return <figure className="my-3 rounded-lg border border-[var(--border)] p-2">
-    <figcaption className="mb-2 break-words text-xs text-[var(--muted-foreground)]">{page.title}</figcaption>
-    {url ? <div className="h-[min(72vh,760px)] w-full"><ImagePreview url={url} filename={page.title} /></div>
-      : <p role="status" className="text-sm">{state.kind === "error" ? t("Failed to load image.") : t("Loading...")}</p>}
-  </figure>;
+  return url ? (
+    <div className="h-[min(72vh,760px)] w-full">
+      <ImagePreview url={url} filename={page.title} />
+    </div>
+  ) : (
+    <p role="status" className="p-2 text-sm">
+      {state.kind === "error" ? t("Failed to load image.") : t("Loading...")}
+    </p>
+  );
+}
+
+/**
+ * A source page stays a one-line receipt until the learner asks for it.
+ *
+ * These pages are full textbook scans: opened by default, two of them push the
+ * prose off the screen and the answer reads as a gallery. The summary names the
+ * page, the image is fetched only when expanded, and the expanded image keeps
+ * its own click-to-zoom preview.
+ */
+function SourcePage({ page }: { page: Page }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <details
+      className="group my-3 rounded-lg border border-[var(--border)]"
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary className="flex cursor-pointer list-none items-center gap-2 p-2 text-xs text-[var(--muted-foreground)] transition-colors hover:text-[var(--foreground)] [&::-webkit-details-marker]:hidden">
+        <ChevronRight
+          size={14}
+          className="shrink-0 transition-transform group-open:rotate-90"
+          aria-hidden
+        />
+        <span className="break-words">{page.title}</span>
+      </summary>
+      {open ? (
+        <div className="px-2 pb-2">
+          <SourcePageImage page={page} />
+        </div>
+      ) : null}
+    </details>
+  );
 }
 
 /** Render publication receipts; publication does not prove that a learner viewed a page. */

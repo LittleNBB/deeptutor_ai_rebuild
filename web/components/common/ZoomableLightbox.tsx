@@ -105,7 +105,6 @@ export default function ZoomableLightbox({
         <button
           type="button"
           onClick={() => zoomBy(1 / 1.25)}
-          title={t("Zoom out")}
           aria-label={t("Zoom out")}
           className="rounded-md p-1.5 hover:bg-white/10"
         >
@@ -117,7 +116,6 @@ export default function ZoomableLightbox({
         <button
           type="button"
           onClick={() => zoomBy(1.25)}
-          title={t("Zoom in")}
           aria-label={t("Zoom in")}
           className="rounded-md p-1.5 hover:bg-white/10"
         >
@@ -126,7 +124,6 @@ export default function ZoomableLightbox({
         <button
           type="button"
           onClick={onClose}
-          title={t("Close")}
           aria-label={t("Close")}
           className="rounded-md p-1.5 hover:bg-white/10"
         >

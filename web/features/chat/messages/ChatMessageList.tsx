@@ -450,16 +450,22 @@ function buildMessageBlocks(
   isMastery: boolean,
 ): MessageBlock[] {
   const teaching = new Set<number>();
+  // A presented page is part of the lesson, not working-out: it can sit between
+  // two paragraphs of teaching, and treating it as a fence would fold every
+  // paragraph written before it into "working notes". Skip page cards as well
+  // as trace rows when walking back to earlier lesson text.
+  const foldable = (segment: MessageSegment) =>
+    segment.kind === "trace" || (isMastery && segment.kind === "source_view");
   const preserveTeachingBefore = (index: number) => {
     let before = index - 1;
-    while (before >= 0 && segments[before].kind === "trace") before -= 1;
+    while (before >= 0 && foldable(segments[before])) before -= 1;
     // Later tool work cannot demote an already-written lesson into working
     // notes in a Mastery turn. Ordinary chat preserves only the immediate
     // introduction to its question, keeping earlier exploration folded.
     while (before >= 0) {
       const preceding = segments[before];
       if (preceding.kind === "text") teaching.add(before);
-      else if (!isMastery || preceding.kind !== "trace") break;
+      else if (!isMastery || !foldable(preceding)) break;
       before -= 1;
     }
   };

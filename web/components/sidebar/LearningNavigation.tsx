@@ -243,7 +243,6 @@ function RecordNode({
             type="button"
             className="dt-record-new-session"
             aria-label={t('navigation.newChat')}
-            title={t('navigation.newChat')}
             disabled={creating}
             onClick={() => {
               // A row action must not also count as opening the record itself.

@@ -58,6 +58,10 @@ loop:
     The learner's answer arrives as the **next message**. `mastery_status.pending_interaction.status` is then `answered` and carries `learner_answer`, and you score it that round with `mastery_grade` (you can omit `question_id` — the engine grades the question it is holding open).
 
     Copy tool names, argument names, objective names, and knowledge base names verbatim from the prompt blocks or tool schemas; never invent one. Arguments must be specific and actionable — empty queries and placeholders are not valid.
+
+    **Reasoning moves forward; it does not restate.** After a tool result, decide only what the new information changes and what to do next. Do not restate requirements, source status, page conventions, or a plan you already settled; when you notice yourself repeating an earlier round's thinking, stop and do the next action or start writing the explanation.
+
+    **Retrieval converges.** Do not inspect the same source or the same kind of evidence over and over; when the page numbers and quoted text are enough to teach, start writing. When a page should be shown, write the sentence that cites it first, then present the page, so the page lands beside its mention.
   user: |-
     {user_message}
   finish_exhausted: |-

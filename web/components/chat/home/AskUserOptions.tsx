@@ -738,10 +738,91 @@ export function extractMessageSegments(
     !textFromEvents && answerContent
       ? layOutAnswerContent(kept, answerContent, keptOffsets)
       : kept;
+  // A settled answer places each presented page at the first paragraph that
+  // names it. The tutor usually presents pages before writing, so the card
+  // would otherwise stack at the top of the lesson — the reader meets a full
+  // textbook scan before the sentence that explains what to look at.
+  const withPages =
+    !streaming && answerContent
+      ? placeSourceViewsAtMentions(laidOut)
+      : laidOut;
 
   // Empty text segments last: the layout above creates them, and a blank one
   // would render as an empty ``<AssistantResponse>``.
-  return laidOut.filter((s) => s.kind !== "text" || s.text.length > 0);
+  return withPages.filter((s) => s.kind !== "text" || s.text.length > 0);
+}
+
+/** The page number a presented page's title names, if it names one. */
+function presentedPageNumber(page: PresentedPage): number | null {
+  const match =
+    /(?:PDF\s*)?page\s*(\d+)/i.exec(page.title) ?? /第\s*(\d+)\s*页/.exec(page.title);
+  return match ? Number(match[1]) : null;
+}
+
+/** The first offset in the text that cites one of these pages. */
+function pageMentionIndex(text: string, pages: PresentedPage[]): number {
+  let best = -1;
+  for (const page of pages) {
+    const pageNumber = presentedPageNumber(page);
+    if (pageNumber === null) continue;
+    const patterns = [
+      new RegExp("第\\s*" + pageNumber + "\\s*页"),
+      new RegExp("(?:PDF\\s*)?page\\s*" + pageNumber + "\\b", "i"),
+      new RegExp("C2\\.2\\." + pageNumber + "\\b", "i"),
+    ];
+    for (const pattern of patterns) {
+      const match = pattern.exec(text);
+      if (match && (best < 0 || match.index < best)) best = match.index;
+    }
+  }
+  return best;
+}
+
+/** Where the paragraph containing the offset ends. */
+function paragraphEnd(text: string, offset: number): number {
+  const boundary = text.indexOf("\n\n", offset);
+  return boundary < 0 ? text.length : boundary;
+}
+
+/**
+ * Move each presented page card under the paragraph that cites it.
+ *
+ * Cards arrive where the tool call happened, which in a teach-first turn is
+ * before any prose: the tutor retrieves and presents, then writes. The answer
+ * itself names the pages ("上面第 10 页…"), so that mention is the position the
+ * reader expects. A page nothing mentions stays where it was — a collapsed
+ * receipt is harmless at the top.
+ */
+function placeSourceViewsAtMentions(segments: MessageSegment[]): MessageSegment[] {
+  const views = segments.filter(
+    (segment): segment is Extract<MessageSegment, { kind: "source_view" }> =>
+      segment.kind === "source_view",
+  );
+  if (views.length === 0) return segments;
+  let placed = segments;
+  for (const view of views) {
+    const target = placed.find(
+      (segment) => segment.kind === "text" && pageMentionIndex(segment.text, view.pages) >= 0,
+    );
+    if (!target || target.kind !== "text") continue;
+    const mention = pageMentionIndex(target.text, view.pages);
+    const cut = paragraphEnd(target.text, mention);
+    const before = target.text.slice(0, cut).trimEnd();
+    const after = target.text.slice(cut).replace(/^\n+/, "");
+    const insert: MessageSegment[] = [];
+    if (before) insert.push({ ...target, text: before });
+    insert.push(view);
+    if (after) insert.push({ ...target, key: target.key + "-tail-" + view.key, text: after });
+    const withoutView = placed.filter((segment) => segment !== view);
+    const targetIndex = withoutView.indexOf(target);
+    if (targetIndex < 0) continue;
+    placed = [
+      ...withoutView.slice(0, targetIndex),
+      ...insert,
+      ...withoutView.slice(targetIndex + 1),
+    ];
+  }
+  return placed;
 }
 
 /**

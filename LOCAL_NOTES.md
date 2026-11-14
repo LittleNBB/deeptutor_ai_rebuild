@@ -219,3 +219,25 @@ DSH 的 Mnemon 文档里有三份更细的记录（搜索 “DeepTutor”）：
 - 构建/部署（承接第十三节）：`DEEPTUTOR_NEXT_DIST_DIR=.next-deeptutor npm run build` 之前必须先停 3782（Windows 上 `libvips-42.dll` 被占用会 EPERM）；启动脚本 `X:/AI/_start_web.ps1`（PORT=3782、API 8001、DEEPTUTOR_HOME），后端 `X:/AI/_restart_backend.ps1`。
 - 回滚：`git revert <本提交>`；若只想撤掉行内加号，删掉 `LearningNavigation.tsx` 的 mastery 按钮与 `modern.css` 的 `.dt-record-new-session` 规则，后端接口可保留（无调用方）。
 
+## 十五、精通回复：正文折叠、页图位置与思维链收敛（2026-11-14）
+
+- 需求（用户原话，m00993/m00994）：1 思维链过度、内容基本相同反复思考；2 正文和图片位置混乱，正文竟在“过程记录”里，点一下就折叠；3 引用图片应在正文对应位置，不是开头/结尾；4 图片引用默认折叠，像思维链点击展开。确认：图片按页码自动就近插入；思维链不是限制轮次，是内容重复，要减少。
+- 根因：
+  1. web/features/chat/messages/ChatMessageList.tsx 的 buildMessageBlocks 只保留末尾连续 text 作为答案；该轮 messageSegments 依次为 trace、source_view(page10)、trace、text(3726)、source_view(page11)，末尾是页卡，answerStart 落到数组长度，正文被并进 process 折叠块。
+  2. 页图事件来自最后一轮工具调用，天然排在全部正文之前；该轮 16 个 rag tool_result 的 metadata.assistant_content_offset 全为 None，前端无法按 offset 定位，只能放在开头/结尾。
+  3. MasterySourcePresentation.tsx 的 SourcePage 默认展开整页原图，两张就把正文顶出屏幕。
+  4. 思维链每轮开头复述“学习者要求 / 资料 ready / 页码约定 / 下一步计划”，第 9 轮仍在复述同一套上下文。
+- 改动：
+  - ChatMessageList.tsx：foldable = trace || (isMastery && source_view)；preserveTeachingBefore 回退时跳过这两类，正文不再因页卡被折进“过程记录”。
+  - web/components/chat/home/AskUserOptions.tsx：新增 placeSourceViewsAtMentions——按正文里的“第 N 页 / page N / C2.2.N”找到页码提及，把对应 source_view 移到该段之后，并把正文切成多段；无提及则保留原位。extractMessageSegments 在消息 settled 后调用。
+  - MasterySourcePresentation.tsx：SourcePage 改为 details 默认 closed，summary 只显示“文件名 · PDF page N”；图片组件仅在展开后挂载，展开后仍可点击全屏。
+  - deeptutor/capabilities/mastery/prompts/zh|en/mastery_loop.yaml：增加“推理只前进，不复述”“检索要收敛”“先写下引用它的句子，再展示页”。
+  - deeptutor/services/persona/presets/teacher/PERSONA.md（运行目录 data/user/workspace/personas/teacher/PERSONA.md 同步）：增加“## 思考方式”，要求推理只用于决定下一步，发现重复就停止推演。
+- 验证（生产 3782 + 后端 8001，Edge/Playwright）：
+  - 目标会话 unified_1794637340178_733de588：最终 details=2、无“过程记录”按钮、正文 H2 不在折叠容器内；page10 卡紧跟提到“上面第 10 页…那张图就是采样过程的原貌”的段落后，page11 卡紧跟“上面第 11 页四张图里…”段落后；两卡默认 closed，展开后 img 826×619.5（natural 1440×1080），可点开全屏；已人工核对正文与两张页卡的实际 DOM 顺序。
+  - 一次临时 mastery 会话（已删除）实测：20.4 秒、2 次 rag；thinking 3,257 字符 / 1,855 个 delta，对比旧问题轮 29,418 字符 / 15,805 delta、9 轮 16 次工具调用；仍有一轮页码歧义的自我讨论，但不再每轮复述同一套上下文。结论：提示词是收敛措施，不保证每次都短，需继续观察。
+  - npm run test:node：1335 pass / 0 fail；npx tsc --noEmit -p tsconfig.json 退出 0；干净构建成功。
+- 关键坑（承接第十三、十四节）：X: 盘上源文件 mtime 不随编辑更新（ChatMessageList.tsx 改后仍显示 2026-11-05 20:33:09），webpack 会复用旧模块，构建“成功”但产物没变。改前端后必须：停 3782 → rm -rf web/.next-deeptutor → DEEPTUTOR_NEXT_DIST_DIR=.next-deeptutor npm run build → 启动。只跑 build 不删目录时，页面会继续显示旧折叠逻辑。
+- 回滚：git revert <本提交>；若只想退回旧折叠行为，删掉 ChatMessageList.tsx 的 foldable 分支即可，其余为独立增强。
+
+

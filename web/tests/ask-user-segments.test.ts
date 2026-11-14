@@ -727,3 +727,23 @@ test("private inspection and unsafe preview URLs never become a page", () => {
     assert.ok(segments.every((segment) => segment.kind !== "source_view"));
   }
 });
+
+test("a settled page card moves to the paragraph that cites it", () => {
+  const answer = "先看第 7 页的图。\n\n它给出面积。";
+  const segments = extractMessageSegments(
+    [
+      event("tool_call", { call_id: "t1" }, "rag"),
+      presentedPage("teaching"),
+      event("content", { call_id: "r2", call_kind: "agent_loop_round" }, answer),
+    ],
+    answer,
+    { streaming: false },
+  );
+
+  assert.deepEqual(
+    segments.map((segment) => segment.kind),
+    ["trace", "text", "source_view", "text"],
+  );
+  assert.equal(segments[1].kind === "text" && segments[1].text, "先看第 7 页的图。");
+  assert.equal(segments[3].kind === "text" && segments[3].text, "它给出面积。");
+});
