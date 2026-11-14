@@ -93,6 +93,7 @@ turn 持久化 → 前端 `web/features/chat` 重放 / 渲染
 | 消息正文、折叠、过程记录 | `web/features/chat/messages/ChatMessageList.tsx`、`web/components/common/AssistantResponse.tsx` | 正文/思维链/工具卡的分段和折叠都在这里；改动前先看 `buildMessageBlocks` |
 | Markdown、公式、代码块 | `web/components/common/RichMarkdownRenderer.tsx`、`MarkdownRenderer.tsx`、`RichCodeBlock.tsx` | 图片分支和 `attachment:` 链接也在这里 |
 | 左侧栏、学习记录 | `web/components/sidebar/SidebarShell.tsx`、`LearningNavigation.tsx`、`WorkspaceSidebar.tsx`、`web/features/ui-layout/modern/modern.css` | 精通记录行的“新建会话”加号在 `LearningNavigation` + `dt-record-new-session` |
+| 聊天消息导航（目录/回到底部） | `web/features/chat/components/ChatWorkspace.tsx`、`web/components/space/learning/MasteryStudy.tsx`（精通之路）、`web/components/chat/home/ChatOutlinePanel.tsx`、`web/hooks/useChatAutoScroll.ts`、`web/lib/chat-outline.ts` | 右侧对话目录 + 悬浮“回到底部”；聊天与精通之路共用；宽屏并排、窄屏覆盖；细节见 `LOCAL_NOTES.md` 第十六节 |
 | 精通之路行为 | `deeptutor/capabilities/mastery/{capability,loop,tools}.py`、`deeptutor/capabilities/mastery/prompts/{zh,en}/mastery_loop.yaml` | 提示词是软约束；硬门在 `deeptutor/learning/lesson_evidence.py` |
 | 精通数据/评分/复习 | `deeptutor/learning/{service,lesson_evidence,scheduler,grading,storage,models}.py`、`data/user/workspace/learning/mastery/mastery.sqlite3` | 先分清“教学内容”和“掌握度证据”，不要用页面状态替代证据 |
 | 精通页卡/页码定位 | `web/components/chat/home/MasterySourcePresentation.tsx`、`AskUserOptions.tsx` | 页卡默认折叠、按正文页码就近插入；页码提及解析在 `AskUserOptions` |
@@ -149,6 +150,7 @@ Python 侧：本机 `.venv` 目前**没有安装 pytest**，不能假装跑过 `
 | 默认 teacher 人格、侧栏顶部“新对话”、精通记账容错 | `services/session/turns/executor.py`、`SidebarShell.tsx`、`capabilities/mastery/tools.py`、`prompts/{zh,en}/mastery_loop.yaml` | 第十三节 |
 | 精通记录行右侧“+ 新建会话” | `api/routers/mastery_path.py`、`web/lib/learning-api.ts`、`LearningNavigation.tsx`、`modern.css` | 第十四节 |
 | 精通正文不被折进过程记录、页图按页码插入、默认折叠 | `web/features/chat/messages/ChatMessageList.tsx`、`MasterySourcePresentation.tsx`、`AskUserOptions.tsx` | 第十五节 |
+| 右侧对话目录与一键回到底部 | `ChatWorkspace.tsx`、`MasteryStudy.tsx`、`ChatOutlinePanel.tsx`、`useChatAutoScroll.ts`、`locales/*/app.json` | 第十六节 |
 
 ## 9. 文档导航：哪些该读，哪些可以忽略
 

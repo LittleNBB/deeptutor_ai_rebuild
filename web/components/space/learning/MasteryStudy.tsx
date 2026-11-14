@@ -9,11 +9,13 @@ import Tooltip from "@/shared/ui/Tooltip";
 import dynamic from "next/dynamic";
 import Link from "next/link";
 import {
+  ArrowDown,
   ArrowLeft,
   ArrowRight,
   BookmarkPlus,
   Compass,
   Flag,
+  ListOrdered,
   Loader2,
   Map as MapIcon,
   MessageCircle,
@@ -24,6 +26,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { ChatMessageList } from "@/features/chat/messages";
+import { ChatOutlinePanel } from "@/components/chat/home/ChatOutlinePanel";
 import { ChatViewerBridges } from "@/components/chat/home/ChatViewerBridges";
 import { buildSessionActivity } from "@/lib/session-activity";
 import { TurnNavigator } from "@/components/chat/home/TurnNavigator";
@@ -216,6 +219,46 @@ export function MasteryStudy({
     [],
   );
   const [viewerOpen, setViewerOpen] = useState(false);
+  const [chatOutlineOpen, setChatOutlineOpen] = useState(true);
+  // The transcript's own outline — the learner's questions in this session — is
+  // a different map from the topic outline on the left: only this one answers
+  // "where was the point I asked about". Shared key with chat, so the choice
+  // reads as one preference rather than two.
+  useEffect(() => {
+    let open = true;
+    try {
+      const stored = browserStorage.readRaw("local", "dt:chat:outline-panel");
+      open = stored === "1" ? true : stored === "0" ? false : window.innerWidth >= 1280;
+    } catch {
+      // Private mode / blocked storage: the default (open) stands.
+    }
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setChatOutlineOpen(open);
+  }, []);
+  const closeChatOutline = useCallback(() => {
+    setChatOutlineOpen(false);
+    try {
+      browserStorage.writeRaw("local", "dt:chat:outline-panel", "0");
+    } catch {
+      // Preference is best-effort; the session still honours the toggle.
+    }
+  }, []);
+  const toggleChatOutline = useCallback(() => {
+    if (chatOutlineOpen) {
+      closeChatOutline();
+      return;
+    }
+    setChatOutlineOpen(true);
+    try {
+      browserStorage.writeRaw("local", "dt:chat:outline-panel", "1");
+    } catch {
+      // Same as above.
+    }
+    // One right-hand rail at a time: the activity viewer and this outline would
+    // otherwise paint over each other.
+    setViewerOpen(false);
+  }, [chatOutlineOpen, closeChatOutline]);
+  const [nearBottom, setNearBottom] = useState(false);
   const [showSaveModal, setShowSaveModal] = useState(false);
   const sessionActivity = buildSessionActivity(state.messages);
   /* ── Transcript scrolling ────────────────────────────────────────────
@@ -275,6 +318,16 @@ export function MasteryStudy({
     shouldAutoScrollRef.current = true;
     scrollToBottom("instant");
   }, [scrollToBottom, shouldAutoScrollRef]);
+  // The pin only reports through scroll events, so a session that opens far from
+  // the bottom (this screen opens at the top on purpose) would otherwise show
+  // "back to bottom" even when there is nothing below.
+  useEffect(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    setNearBottom(
+      container.scrollHeight - container.scrollTop - container.clientHeight < 80,
+    );
+  }, [messagesContainerRef, hasMessages, state.messages.length, sessionLoading]);
 
   const notebookFallbackTitle = topic
     ? topicDisplayName(topic, t)
@@ -640,6 +693,23 @@ export function MasteryStudy({
         />
 
         <div className="flex shrink-0 items-center gap-1.5 pl-2">
+          <Tooltip label={t("Conversation outline")}>
+            <button
+              type="button"
+              onClick={toggleChatOutline}
+              aria-label={t("Conversation outline")}
+              aria-pressed={chatOutlineOpen}
+              title={t("Jump to one of your questions")}
+              className={
+                "flex h-8 w-8 items-center justify-center rounded-lg transition-colors " +
+                (chatOutlineOpen
+                  ? "bg-[var(--muted)] text-[var(--foreground)]"
+                  : "text-[var(--muted-foreground)] hover:bg-[var(--muted)]/60 hover:text-[var(--foreground)]")
+              }
+            >
+              <ListOrdered className="h-4 w-4" />
+            </button>
+          </Tooltip>
           <Tooltip label={t("Save to Notebook")}>
             <button
               type="button"
@@ -653,7 +723,11 @@ export function MasteryStudy({
           </Tooltip>
           <button
             type="button"
-            onClick={() => setViewerOpen((open) => !open)}
+            onClick={() => {
+              const next = !viewerOpen;
+              setViewerOpen(next);
+              if (next) setChatOutlineOpen(false);
+            }}
             className="flex h-8 w-8 items-center justify-center rounded-lg text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)]/60 hover:text-[var(--foreground)]"
             aria-label={t("Activity")}
             aria-pressed={viewerOpen}
@@ -689,7 +763,7 @@ export function MasteryStudy({
         </aside>
 
         <section className="flex min-w-0 flex-1 flex-col bg-[var(--background)]">
-          <div className="relative min-h-0 flex-1">
+          <div className="relative flex min-h-0 flex-1">
             <div
               ref={messagesContainerRef}
               // Opts this scrollport into the global `overflow-anchor: none`
@@ -703,6 +777,8 @@ export function MasteryStudy({
                   container.scrollHeight -
                   container.scrollTop -
                   container.clientHeight;
+                const atBottom = distanceFromBottom < 80;
+                setNearBottom((current) => (current === atBottom ? current : atBottom));
                 // Arm-only while streaming: position alone should never
                 // RELEASE the pin mid-turn (a gesture already does that,
                 // unconditionally, inside the hook) — only ever confirm the
@@ -713,7 +789,7 @@ export function MasteryStudy({
                   handleMessagesScroll();
                 }
               }}
-              className="h-full overflow-y-auto [scrollbar-gutter:stable]"
+              className="h-full min-w-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]"
             >
               <div
                 data-chat-column="true"
@@ -870,6 +946,35 @@ export function MasteryStudy({
               onJump={jumpToTurn}
               onJumpToBottom={resumeFollowingLatest}
             />
+            {chatOutlineOpen ? (
+              <ChatOutlinePanel
+                entries={chatOutline}
+                scrollRootRef={messagesContainerRef}
+                onJump={(entry) => {
+                  jumpToTurn(entry.key);
+                  // Narrow screens overlay the panel on the transcript; once the
+                  // reader has jumped, it should not keep covering the answer.
+                  if (window.innerWidth < 1280) closeChatOutline();
+                }}
+                onClose={closeChatOutline}
+              />
+            ) : null}
+            {hasMessages && !nearBottom ? (
+              <button
+                type="button"
+                data-back-to-bottom="true"
+                onClick={resumeFollowingLatest}
+                aria-label={t("Back to bottom")}
+                title={t("Back to bottom")}
+                className={
+                  "absolute bottom-4 z-20 inline-flex h-9 items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--background)] px-3 text-[11.5px] font-medium text-[var(--foreground)] shadow-lg transition-[background-color,right] duration-200 hover:bg-[var(--muted)] " +
+                  (chatOutlineOpen ? "right-[304px]" : "right-4")
+                }
+              >
+                <ArrowDown size={14} strokeWidth={1.8} aria-hidden="true" />
+                <span>{t("Back to bottom")}</span>
+              </button>
+            ) : null}
           </div>
 
           {!sessionError && (

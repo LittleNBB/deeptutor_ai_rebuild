@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 interface AutoScrollOptions {
   hasMessages: boolean;
@@ -24,6 +24,20 @@ export function useChatAutoScroll({
   const endRef = useRef<HTMLDivElement>(null);
   const shouldAutoScrollRef = useRef(true);
   const positionRef = useRef({ top: 0, height: 0, viewport: 0 });
+  // Whether the live end is on screen. This is state only so chrome such as the
+  // chat's back-to-bottom control can react to it; the ref takes the value on
+  // every scroll event, so the component re-renders on threshold crossings, not
+  // per frame.
+  const [isAtBottom, setIsAtBottom] = useState(true);
+  const atBottomRef = useRef(true);
+
+  const syncAtBottom = useCallback((container: HTMLDivElement) => {
+    const next =
+      container.scrollHeight - container.scrollTop - container.clientHeight < 80;
+    if (next === atBottomRef.current) return;
+    atBottomRef.current = next;
+    setIsAtBottom(next);
+  }, []);
 
   const rememberPosition = useCallback((container: HTMLDivElement) => {
     positionRef.current = {
@@ -38,11 +52,18 @@ export function useChatAutoScroll({
     if (!container) return;
     container.scrollTop = container.scrollHeight;
     rememberPosition(container);
-  }, [rememberPosition]);
+    syncAtBottom(container);
+  }, [rememberPosition, syncAtBottom]);
 
   useLayoutEffect(() => {
-    if (hasMessages && shouldAutoScrollRef.current) pinToBottom();
-  }, [pinToBottom, hasMessages, isStreaming, messageCount,
+    if (hasMessages && shouldAutoScrollRef.current) {
+      pinToBottom();
+    } else if (containerRef.current) {
+      // Loaded history opens wherever the reader left it; read the control's
+      // state from that position instead of assuming the live end is visible.
+      syncAtBottom(containerRef.current);
+    }
+  }, [pinToBottom, syncAtBottom, hasMessages, isStreaming, messageCount,
     lastMessageContent, lastEventCount, composerHeight]);
 
   const handleScroll = useCallback(() => {
@@ -61,8 +82,9 @@ export function useChatAutoScroll({
       shouldAutoScrollRef.current = true;
     }
     else if (container.scrollTop < expected - 4) shouldAutoScrollRef.current = false;
+    syncAtBottom(container);
     rememberPosition(container);
-  }, [rememberPosition]);
+  }, [rememberPosition, syncAtBottom]);
 
   useEffect(() => {
     if (!hasMessages) return;
@@ -73,8 +95,12 @@ export function useChatAutoScroll({
       if (rafId) return;
       rafId = requestAnimationFrame(() => {
         rafId = 0;
-        if (shouldAutoScrollRef.current) pinToBottom();
-        else rememberPosition(container);
+        if (shouldAutoScrollRef.current) {
+          pinToBottom();
+        } else {
+          rememberPosition(container);
+          syncAtBottom(container);
+        }
       });
     };
     // A scrollport's own box does not grow with scrollHeight. Observe its
@@ -131,12 +157,19 @@ export function useChatAutoScroll({
       container.removeEventListener("pointerdown", onPointerDown, true);
       if (rafId) cancelAnimationFrame(rafId);
     };
-  }, [hasMessages, pinToBottom, rememberPosition]);
+  }, [hasMessages, pinToBottom, rememberPosition, syncAtBottom]);
 
   const scrollToBottom = useCallback((_behavior: ScrollBehavior) => {
     void _behavior;
     pinToBottom();
   }, [pinToBottom]);
 
-  return { containerRef, endRef, shouldAutoScrollRef, scrollToBottom, handleScroll };
+  return {
+    containerRef,
+    endRef,
+    shouldAutoScrollRef,
+    isAtBottom,
+    scrollToBottom,
+    handleScroll,
+  };
 }

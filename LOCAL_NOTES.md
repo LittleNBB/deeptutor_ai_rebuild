@@ -240,4 +240,26 @@ DSH 的 Mnemon 文档里有三份更细的记录（搜索 “DeepTutor”）：
 - 关键坑（承接第十三、十四节）：X: 盘上源文件 mtime 不随编辑更新（ChatMessageList.tsx 改后仍显示 2026-11-05 20:33:09），webpack 会复用旧模块，构建“成功”但产物没变。改前端后必须：停 3782 → rm -rf web/.next-deeptutor → DEEPTUTOR_NEXT_DIST_DIR=.next-deeptutor npm run build → 启动。只跑 build 不删目录时，页面会继续显示旧折叠逻辑。
 - 回滚：git revert <本提交>；若只想退回旧折叠行为，删掉 ChatMessageList.tsx 的 foldable 分支即可，其余为独立增强。
 
+## 十六、聊天对话目录与一键回到底部（2026-11-14）
+
+- 需求（用户原话，m00002）：DTR 打开对话默认在顶端且没有一键到底的按钮（默认在顶端这点不用改）；边上没有对话历史记录，需要自己翻到对应位置，很麻烦。确认口径（m00080）：打开在顶部的问题不用管，只要侧边目录 + 一键到底。
+- 现状：上游 v1.7.1 只有左侧 gutter 的 TurnNavigator 刻度（无标签、hover 才预览、不足 3 问或窄窗口直接隐藏），没有可见按钮；打开会话的位置由 useChatAutoScroll 决定，本次未改动。
+- 改动：
+  - 新建 `web/components/chat/home/ChatOutlinePanel.tsx`：右侧 288px 对话目录，每条用户提问一行（序号 + 两行标题 + 回复首句）；点击调用 ChatWorkspace 的 jumpToTurn（复用 `scrollToChatTurn`，topOffset 56 + turn-flash 闪烁）；滚动时按距顶部 140px 的判定线高亮当前行，并用 `offsetTop` 让列表跟随；顶部显示条数与关闭按钮。`aside` 上带 `data-outline-panel="true"`。
+  - `web/hooks/useChatAutoScroll.ts`：新增 `isAtBottom`（阈值 80px，只在跨阈值时 setState，滚动每帧不重渲染），随 hook 返回。
+  - `web/features/chat/components/ChatWorkspace.tsx`：头部 actions 增加 ListOrdered 按钮（t("Conversation outline")，title 用原有 "Jump to one of your questions" 文案）；新增 `outlineOpen` 状态与 `dt:chat:outline-panel` 持久化（存 "1"/"0"；无存量时 ≥1280 展开、<1280 收起）；`jumpToOutlineTurn` 在窄屏跳转后自动收起；消息区 wrapper 改为 `flex-row`；未在底部时渲染悬浮胶囊按钮 `data-back-to-bottom`（右侧偏移随面板开合 304/16px），点击执行 resumeFollowingLatest（重新跟随并置底）。
+  - 文案：`web/locales/{en,zh,de,fr,ja,pl,pt,tr,uk,vi}/app.json` 各新增 "Conversation outline" / "Back to bottom" / "No questions yet"（中文：对话目录 / 回到底部 / 还没有提问）。strict 语言（de/vi/tr/ja/pl/pt）必须补齐，否则 `npm run i18n:audit` 退出 1。
+- 验证（2026-11-14 晚，生产 3782）：
+  - `node ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.json` 退出 0；eslint 三个改动文件 0 error（ChatWorkspace 里 img/alt 两条 warning 是既有代码）；`i18n_parity` OK；`i18n_audit` 退出 0（strict 语言 used keys 100%）。
+  - 干净重建：停 3782 → `rm -rf web/.next-deeptutor` → `DEEPTUTOR_NEXT_DIST_DIR=.next-deeptutor node ./scripts/build.mjs`，BUILD_ID `ji_OHak4E6tT4OexBFqiO`。
+  - Edge/Playwright 1440x900 实测会话 unified_1794637340178_733de588：目录 7 行、滚动/跳转后 active 行跟随；FAB 在滚到顶部后出现（文案“回到底部”）、点击回到底部并消失；点第 3 条后 scrollTop 6498、turn-flash=1、active 变第 3 条；头部按钮可关/开；1000x800 下 aside 变 absolute 覆盖层、跳转后自动关闭；console 无 error。截图：X:/AI/AI对话/DSH对话/shot-outline-panel.png、shot-back-to-bottom.png、shot-outline-active.png。
+- 运行注意：本次验证用的前端是手工启的 standalone 实例（`cd web/.next-deeptutor/standalone` 后设 PORT=3782、HOSTNAME=0.0.0.0、DEEPTUTOR_API_BASE_URL=http://127.0.0.1:8001、DEEPTUTOR_AUTH_ENABLED=false、NEXT_PUBLIC_AUTH_ENABLED=false 再 `node server.js`）；如果用 `python scripts/start_web.py` 托管，正常重启 launcher 即可，它会复用已占用的 8001/3782。
+- 已知边界：目录只收用户提问（复用 `buildChatOutline`），不列工具/系统记录；打开会话仍按原逻辑停在顶部，本次没动（用户明确要求不改）；面板宽度与 `xl` 断点（1280px）绑定。
+- 精通之路会话（2026-11-14 深夜补齐，用户反馈“精通之路对话中没有”）：该路由不走 ChatWorkspace，而是 `web/app/(workspace)/learning/mastery/[pathId]/sessions/[sessionId]/page.tsx` → `web/components/space/learning/MasteryStudy.tsx`。复用同一套 ChatOutlinePanel / scrollToChatTurn / useChatAutoScroll，改动：
+  - MasteryStudy 头部加 ListOrdered 按钮（aria-pressed，title 复用 "Jump to one of your questions"）；`chatOutlineOpen` 与 `dt:chat:outline-panel` 持久化，与聊天共用同一份面板偏好；打开 Activity 侧栏时自动收起目录，保证右侧只有一条栏。
+  - 转写区父容器改 `relative flex`，滚动区 `min-w-0 flex-1`，目录作为兄弟节点：≥1280px 静态并排（不再遮正文，实测正文右缘与面板左缘留 10px），<1280px 仍 absolute 覆盖层；覆盖层下点击目录跳转后自动关闭。
+  - `nearBottom` 由滚动距离阈值 80px 维护，并在 messages/session 变化时重算；`hasMessages && !nearBottom` 渲染 `data-back-to-bottom` 胶囊，右侧 304/16px 随目录开合。
+- 验证（2026-11-15 00:30，生产 3782，BUILD_ID dqXoFBUzt7gCXG1V3XuMF）：1440x900 精通会话 unified_1794637340178_733de588 面板 position=static、7 行、正文与面板 overlap=-10px；跳转 scrollTop 6760、面板保持；回到底部后 dist=0 且 FAB 消失；1000x800 打开目录→跳转后面板自动关闭、scrollTop 5202；普通聊天 /chat/unified_... 目录默认 1 个/7 行、滚到顶部 FAB 出现；三处 console/pageerror 均为空。tsc 退出 0、eslint 退出 0。截图：shot-mastery-final.png、shot-mastery-narrow-after-jump.png。
+- 回滚：`git checkout -- web/features/chat/components/ChatWorkspace.tsx web/components/space/learning/MasteryStudy.tsx web/hooks/useChatAutoScroll.ts web/locales` 并删除 ChatOutlinePanel.tsx；面板本身可随时用头部按钮关闭，不影响消息流。
+
 

@@ -37,6 +37,7 @@ import type { SelectedQuestionEntry } from "@/components/chat/QuestionBankPicker
 import ChatComposer from "@/components/chat/home/ChatComposer";
 import { ChatMessageList } from "@/features/chat/messages";
 import { TurnNavigator } from "@/components/chat/home/TurnNavigator";
+import { ChatOutlinePanel } from "@/components/chat/home/ChatOutlinePanel";
 import SessionLoadingView from "@/components/chat/home/SessionLoadingView";
 import {
   SESSION_LOAD_TIMEOUT_MS,
@@ -61,7 +62,7 @@ import {
   GeogebraTabProvider,
   useGeogebraTabOpener,
 } from "@/context/GeogebraTabContext";
-import { Archive, PanelRight } from "lucide-react";
+import { ArrowDown, Archive, ListOrdered, PanelRight } from "lucide-react";
 import ChatSessionMenu from "@/features/chat/components/ChatSessionMenu";
 import HeaderActionButton from "@/features/chat/components/HeaderActionButton";
 import { ChatLocation } from "@/features/chat/components/ChatLocation";
@@ -441,6 +442,27 @@ export default function ChatWorkspace() {
       }
       return next;
     });
+  }, []);
+  // The conversation outline: one row per question, docked to the right of the
+  // transcript when the window has room for it and an overlay when it does not.
+  // A stored choice wins; otherwise it starts open only on wide windows.
+  const [outlineOpen, setOutlineOpen] = useState(true);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const stored = browserStorage.readRaw("local", "dt:chat:outline-panel");
+    if (stored === "1") {
+      setOutlineOpen(true);
+    } else if (stored === "0") {
+      setOutlineOpen(false);
+    } else if (window.innerWidth < 1280) {
+      setOutlineOpen(false);
+    }
+  }, []);
+  const setOutlineOpenPersisted = useCallback((next: boolean) => {
+    setOutlineOpen(next);
+    if (typeof window !== "undefined") {
+      browserStorage.writeRaw("local", "dt:chat:outline-panel", next ? "1" : "0");
+    }
   }, []);
   /**
    * Force the panel open on its Activity home. Used by the send-gate when the
@@ -1155,6 +1177,7 @@ export default function ChatWorkspace() {
     containerRef: messagesContainerRef,
     endRef: messagesEndRef,
     shouldAutoScrollRef,
+    isAtBottom,
     scrollToBottom,
     handleScroll: handleMessagesScroll,
   } = useChatAutoScroll({
@@ -1188,6 +1211,17 @@ export default function ChatWorkspace() {
       }
     },
     [messagesContainerRef, shouldAutoScrollRef],
+  );
+  const jumpToOutlineTurn = useCallback(
+    (entry: { key: string }) => {
+      jumpToTurn(entry.key);
+      // On a narrow window the outline is an overlay: get out of the way once
+      // the reader has landed on the question they picked.
+      if (typeof window !== "undefined" && window.innerWidth < 1280) {
+        setOutlineOpenPersisted(false);
+      }
+    },
+    [jumpToTurn, setOutlineOpenPersisted],
   );
   /** Leave history and start following the live end of the turn again. */
   const resumeFollowingLatest = useCallback(() => {
@@ -2671,6 +2705,13 @@ export default function ChatWorkspace() {
                 ) : null}
               </PageBarSlot>
               <PageBarSlot name="actions" className="flex shrink-0 items-center gap-0.5">
+                <HeaderActionButton
+                  onClick={() => setOutlineOpenPersisted(!outlineOpen)}
+                  active={outlineOpen}
+                  icon={ListOrdered}
+                  label={t("Conversation outline")}
+                  title={t("Jump to one of your questions")}
+                />
                 <PageCustomizeButton page="chat" capabilities={visibleCapabilities} compact />
                 <HeaderActionButton
                   onClick={() => viewerPanelRef.current?.openMarkdownNoteTab()}
@@ -2737,7 +2778,7 @@ export default function ChatWorkspace() {
                 // turn navigator can overlay the left gutter without living
                 // inside the masked scroll container (its top/bottom fade
                 // would clip the rail's ends).
-                <div className="relative flex w-full flex-1 min-h-0 flex-col">
+                <div className="relative flex w-full flex-1 min-h-0 flex-row">
                   <div
                     ref={messagesContainerRef}
                     data-chat-scroll-root="true"
@@ -2848,6 +2889,30 @@ export default function ChatWorkspace() {
                     onJump={jumpToTurn}
                     onJumpToBottom={resumeFollowingLatest}
                   />
+                  {hasMessages && !isAtBottom ? (
+                    <button
+                      type="button"
+                      data-back-to-bottom="true"
+                      onClick={resumeFollowingLatest}
+                      aria-label={t("Back to bottom")}
+                      title={t("Back to bottom")}
+                      className={
+                        "absolute bottom-4 z-20 inline-flex h-9 items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--background)] px-3 text-[11.5px] font-medium text-[var(--foreground)] shadow-lg transition-[background-color,right] duration-200 hover:bg-[var(--muted)] " +
+                        (outlineOpen ? "right-[304px]" : "right-4")
+                      }
+                    >
+                      <ArrowDown size={14} strokeWidth={1.8} aria-hidden="true" />
+                      <span>{t("Back to bottom")}</span>
+                    </button>
+                  ) : null}
+                  {outlineOpen ? (
+                    <ChatOutlinePanel
+                      entries={chatOutline}
+                      scrollRootRef={messagesContainerRef}
+                      onJump={jumpToOutlineTurn}
+                      onClose={() => setOutlineOpenPersisted(false)}
+                    />
+                  ) : null}
                 </div>
               )}
 
