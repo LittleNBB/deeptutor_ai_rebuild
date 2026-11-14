@@ -6,6 +6,8 @@ on another release. The version authority is
 [`deeptutor/__version__.py`](../deeptutor/__version__.py). Commands below run
 from the repository root unless a page says otherwise.
 
+本机维护的入口：[代码地图（中文）](CODE_MAP.zh-CN.md) —— 按目录说明各部分功能、常见改动落点，以及构建/运行坑。本机定制与运行细节见 [`LOCAL_NOTES.md`](../LOCAL_NOTES.md)。
+
 ## Choose a reading path
 
 | Your task | Read in order | Completion evidence |

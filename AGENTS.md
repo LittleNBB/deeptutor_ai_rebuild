@@ -9,6 +9,8 @@ through three entry points: CLI, WebSocket API, and Python SDK. All three
 enter the durable turn application service before the shared turn engine
 routes a normalized context to the selected capability.
 
+本机维护的代码地图（中文，目录职责、常见落点、构建坑）：[`docs-for-dev/CODE_MAP.zh-CN.md`](docs-for-dev/CODE_MAP.zh-CN.md)。本机定制见 [`LOCAL_NOTES.md`](LOCAL_NOTES.md)。
+
 ## Architecture
 
 ```
